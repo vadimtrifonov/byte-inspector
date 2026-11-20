@@ -1,46 +1,41 @@
-# Runtime Byte Inspector
+# Static Byte Inspector
 
-Runtime Byte Inspector is a command-line tool for inspecting x86-64 code in PE files and running Windows processes.
-It reads selected byte ranges and displays their disassembly.
-Live inspection shows the code present after loading or runtime patching, which can differ from the executable on disk.
+Static Byte Inspector is a command-line tool for inspecting x86-64 code and data in PE files and raw byte files.
+It searches for strings, byte patterns, and references, and displays disassembly or data at selected addresses.
+Inspection is offline and read-only.
 
-Live inspection is read-only and includes memory outside loaded executables and DLLs, such as trampolines.
-It can resolve pointers and follow jump chains between these locations.
+## Input files
 
-## Targets and captures
+A **PE file** supplies bytes from a Windows x64 executable or DLL, along with its sections, imports, exports, and unwind metadata.
+Addresses in the file use its preferred image base, which can differ from the address where it is loaded at runtime.
 
-A **target** is an address chosen for inspection.
-It can be an offset within an executable or DLL's loaded image (RVA), or an absolute live-process address (VA).
-A **target list** is a JSON file of labeled targets for inspecting several sites together.
-The labels identify the sites when comparing captures.
-See the [example target list](examples/targets.json) and [runtime examples](examples/runtime-targets.json).
-
-A **capture** saves the bytes and inspection results for one or more targets, including disassembly, pointer values, and any followed code.
-Saved JSON captures preserve source information and read times, so the results remain available for review after the process exits.
-Live reads are sequential rather than an atomic snapshot; failed reads are recorded alongside successful results.
+A **raw byte file** contains bytes without headers, such as a saved memory range.
+Its starting virtual address must be supplied so instruction targets and references can be calculated.
+An optional module base and size enable module-relative addresses (RVAs).
 
 ## Commands
 
 | Command | Input | Output |
 |---|---|---|
-| `inspect` | One address in a PE file or running process | Bytes and disassembly or pointer values; text or JSON |
-| `capture` | A target list and a PE file or running process | One saved JSON capture for the selected targets |
-| `export` | A saved capture and target label | A raw byte file and its original starting address |
-| `compare` | Two saved captures | Byte differences, coverage, and labels present in only one capture |
+| `info` | Any supported input file | Source identity and available PE metadata |
+| `find` | String, byte pattern, or number | Matching locations and match counts |
+| `refs` | Address or memory-operand offset | Candidate code references, stored pointers, or matching memory operands |
+| `disasm` | Address and range | Instructions with branch targets and data-reference annotations |
+| `data` | Address and data type | Typed values or pointer targets |
+| `rtti` | MSVC C++ type name in a PE file | Candidate virtual function tables, subobject offsets, and selected slots |
 
-For a before/after check, capture the same labeled sites in each setup, then compare the saved files.
-Comparisons pair matching labels by default or use an explicitly selected pair.
-They compare the targets' own byte ranges; supporting pointer reads and followed code are saved but are not automatically paired.
+Results are JSON and include source hashes to identify the input.
+Reference searches distinguish validated instruction boundaries from unverified byte matches.
+
+Disassembly can use an explicit byte count or ranges from PE unwind metadata, which Windows uses for exception handling.
+These ranges can cover parts of functions rather than whole functions.
 
 ## Getting started
 
-Requires Windows x64 and [mise](https://mise.jdx.dev/).
+Setup and development tasks use [mise](https://mise.jdx.dev/).
 See [SKILL.md](SKILL.md) for setup and operating commands.
 
 ## Development
 
-```powershell
-mise run test
-mise run check
-mise run format
-```
+Run the unit tests with `mise run test`.
+Check the tool's Python formatting and lint rules with `mise run check`.

@@ -1,190 +1,178 @@
-from __future__ import annotations
-
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
+lazy from importlib.metadata import version
 
-from .render import render_inspection
-from .targets import MAX_FOLLOW_HOPS, PATCH_STATES, Target, integer, load_target_list, validate_window
-lazy from .capture import capture_targets, iter_errors, write_capture
-lazy from .compare import compare_captures, render_report
-lazy from .export import export_capture
-lazy from .pe import PeImage
+lazy import capstone
+lazy import pefile
 
-
-def address(value: str) -> int:
-    return integer(value, "address/byte count")
+from .analysis import FORMATS, disassemble, limited, read_data, references, rtti, search
+from .sources import PE, integer, raw_source
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="runtime-byte-inspector", description="Inspect, export, and compare bounded AMD64 byte captures"
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-    inspect = commands.add_parser("inspect", help="Print one PE or live-process byte window")
-    capture = commands.add_parser("capture", help="Read a target list and save one JSON capture")
-    for command in (inspect, capture):
-        source = command.add_mutually_exclusive_group(required=True)
-        source.add_argument("--file", type=Path, help="PE file (disk bytes, not a live image)")
-        source.add_argument("--pid", type=int, help="PID to read; no process-name default")
-        source.add_argument("--process", help="Exact executable name; must match one running process")
-        command.add_argument(
-            "--module", help="Loaded module for RVA targets (default: the process executable)"
-        )
-        command.add_argument(
-            "--before", type=address, default=32, help="Code bytes before target (default: 32)"
-        )
-        command.add_argument(
-            "--after",
-            type=address,
-            default=64,
-            help="Code bytes after target, including followed windows (default: 64)",
-        )
-        command.add_argument(
-            "--follow",
-            type=address,
-            default=0,
-            help=f"Follow up to N live jump/pointer hops (0..{MAX_FOLLOW_HOPS}, default: 0)",
-        )
-        command.add_argument(
-            "--patch-state", choices=PATCH_STATES, help="Live-target annotation (default: unknown)"
-        )
-        command.add_argument("--runtime", help="Optional operator-supplied runtime/build description")
-    target = inspect.add_mutually_exclusive_group(required=True)
-    target.add_argument("--rva", type=address, help="Target address relative to the selected module")
-    target.add_argument(
-        "--va", type=address, help="Absolute live-process address, or preferred-image VA for a file"
-    )
-    origin = inspect.add_mutually_exclusive_group()
-    origin.add_argument("--decode-rva", type=address, help="Assumed decoding start for an RVA target")
-    origin.add_argument("--decode-va", type=address, help="Assumed decoding start for a VA target")
-    inspect.add_argument(
-        "--pointer",
-        action="store_true",
-        help="Read exactly one 8-byte live pointer cell instead of decoding code",
-    )
-    inspect.add_argument(
-        "--span", type=address, help="Summarize the first N target bytes using the captured decoding"
-    )
-    inspect.add_argument("--format", choices=("text", "json"), default="text")
-    capture.add_argument("--targets", type=Path, required=True, help="Target-list JSON file")
-    capture.add_argument(
-        "--group", action="append", help="Select an exact target group; repeat for multiple groups"
-    )
-    capture.add_argument("--output", type=Path, required=True, help="Destination JSON capture")
-    capture.add_argument("--overwrite", action="store_true", help="Replace an existing destination")
-    compare = commands.add_parser("compare", help="Compare primary target windows in two saved captures")
-    compare.add_argument("left", type=Path)
-    compare.add_argument("right", type=Path)
-    compare.add_argument("--left-label", help="Select one left result instead of pairing equal labels")
-    compare.add_argument("--right-label", help="Select one right result; required with --left-label")
-    compare.add_argument(
-        "--alignment",
-        choices=("rva", "target"),
-        default="rva",
-        help="Align module RVAs or offsets from targets; VA targets require target alignment",
-    )
-    compare.add_argument("--format", choices=("text", "json"), default="json")
-    export = commands.add_parser("export", help="Export one saved primary read as a raw byte file")
-    export.add_argument("capture", type=Path, help="Saved JSON capture")
-    export.add_argument("--label", required=True, help="Exact target label")
-    export.add_argument("--output", type=Path, required=True, help="Destination raw byte file")
-    export.add_argument("--overwrite", action="store_true", help="Replace an existing destination")
-    return parser
-
-
-def open_source(args):
-    if args.file is not None:
-        return PeImage(args.file)
-    from .windows import LiveProcess
-
-    return LiveProcess(pid=args.pid, name=args.process, module_name=args.module)
-
-
-def report_capture_errors(capture: dict) -> bool:
-    failed = False
-    for result in capture["results"]:
-        for path, error in iter_errors(result):
-            failed = True
-            print(f"error [{result['target']['label']} {path}]: {error['message']}", file=sys.stderr)
-    return failed
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def number(text):
     try:
-        if args.command == "export":
-            report = export_capture(args.capture, args.label, args.output, args.overwrite)
-            print(json.dumps(report, indent=2))
-            return 0
-        if args.command == "compare":
-            report = compare_captures(
-                args.left,
-                args.right,
-                left_label=args.left_label,
-                right_label=args.right_label,
-                alignment=args.alignment,
-            )
-            print(json.dumps(report, indent=2) if args.format == "json" else render_report(report))
-            return 0
-        validate_window(args.before, args.after)
-        if not 0 <= args.follow <= MAX_FOLLOW_HOPS:
-            raise ValueError(f"--follow must be 0..{MAX_FOLLOW_HOPS}")
-        if args.file is not None and (
-            args.module is not None
-            or args.patch_state is not None
-            or args.follow
-            or getattr(args, "pointer", False)
-        ):
-            raise ValueError("--module, --patch-state, --follow, and --pointer apply only to live processes")
-        if args.runtime is not None and not args.runtime.strip():
-            raise ValueError("--runtime must not be empty")
-        target_list, targets = (
-            load_target_list(args.targets, args.group) if args.command == "capture" else (None, [])
+        return integer(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def signed_number(text):
+    try:
+        return integer(text, signed=True)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def parser():
+    root = argparse.ArgumentParser(
+        description="Read-only offline AMD64 PE and raw-byte inspection; JSON on stdout."
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("info", "Source identity and available PE metadata/imports/exports"),
+        ("find", "Search text, wildcard byte signatures, or encoded numbers"),
+        ("refs", "Find candidate references to an address or field displacement"),
+        ("disasm", "Disassemble an explicit byte range or contiguous unwind region"),
+        ("data", "Read a typed array or pointer table"),
+        ("rtti", "Find MSVC x64 vtables by decorated type name"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        sources = command.add_mutually_exclusive_group(required=True)
+        sources.add_argument("--file", type=Path, help="AMD64 PE32+ file")
+        sources.add_argument("--raw", type=Path, help="Raw AMD64 byte file")
+        command.add_argument("--start-va", type=number, help="VA of the first byte of --raw")
+        command.add_argument(
+            "--module-base", type=number, help="Module VA for raw RVA addressing; requires --module-size"
         )
-        with open_source(args) as source:
-            if args.command == "inspect":
-                rva, va = args.rva, args.va
-                decode_rva, decode_va = args.decode_rva, args.decode_va
-                if args.file is not None and va is not None:
-                    rva, va = va - source.module.base, None
-                    if rva < 0:
-                        raise ValueError("Target VA is below the selected image base")
-                    if decode_va is not None:
-                        decode_rva, decode_va = decode_va - source.module.base, None
-                targets = [
-                    Target(
-                        "site",
-                        rva,
-                        va=va,
-                        decode_rva=decode_rva,
-                        decode_va=decode_va,
-                        kind="pointer" if args.pointer else "code",
-                        span=args.span,
-                    )
-                ]
-            capture = capture_targets(
-                source,
-                targets,
-                args.before,
-                args.after,
-                target_list=target_list,
-                groups=args.group if args.command == "capture" else None,
-                patch_state=args.patch_state or "unknown",
-                runtime=args.runtime,
-                follow=args.follow,
+        command.add_argument(
+            "--module-size", type=number, help="Module image size for --raw; requires --module-base"
+        )
+        if name != "data":
+            command.add_argument(
+                "--limit", type=number, default=100, help="Maximum displayed results (1..10000; default 100)"
             )
-        if args.command == "capture":
-            write_capture(args.output, capture, args.overwrite)
-            print(args.output.resolve())
-        else:
-            print(json.dumps(capture, indent=2) if args.format == "json" else render_inspection(capture))
-        return int(report_capture_errors(capture))
-    except (OSError, ValueError) as exc:
+        if name in ("find", "refs"):
+            command.add_argument("--section", help="Exact source region/PE section name")
+            command.add_argument("--start", help="Scan start: rva:N, va:N, or offset:N; requires --length")
+            command.add_argument("--length", type=number, help="Scan byte count; requires --start")
+        if name == "find":
+            queries = command.add_mutually_exclusive_group(required=True)
+            queries.add_argument("--text")
+            queries.add_argument("--pattern", help="Space-separated bytes with ?? wildcards")
+            queries.add_argument("--value", help="Numeric value encoded according to --type")
+            command.add_argument("--encoding", choices=("ascii", "utf-16le", "both"), default="ascii")
+            command.add_argument("--type", choices=FORMATS, default="u32")
+        elif name == "refs":
+            command.add_argument("address", nargs="?", help="Target: rva:N or va:N")
+            command.add_argument(
+                "--displacement", type=signed_number, help="Nonzero signed memory displacement"
+            )
+            command.add_argument(
+                "--kind", choices=("all", "call", "branch", "memory", "pointer"), default="all"
+            )
+        elif name in ("disasm", "data"):
+            command.add_argument("address", help="rva:N, va:N, or offset:N")
+            if name == "disasm":
+                bounds = command.add_mutually_exclusive_group()
+                bounds.add_argument(
+                    "--bytes",
+                    type=number,
+                    help="Exact byte count; default up to 256 available bytes (maximum 1 MiB)",
+                )
+                bounds.add_argument(
+                    "--unwind",
+                    action="store_true",
+                    help="Use PE unwind metadata around the requested address",
+                )
+            else:
+                command.add_argument("--type", choices=FORMATS, default="u8")
+                command.add_argument("--count", type=number, default=16)
+        elif name == "rtti":
+            command.add_argument("name", help="Exact decorated type name, such as .?AVActor@@")
+            command.add_argument("--slot-start", type=number, default=0)
+            command.add_argument("--slots", type=number, default=16)
+    return root
+
+
+def run(args):
+    if hasattr(args, "limit") and not 1 <= args.limit <= 10000:
+        raise ValueError("--limit must be 1..10000")
+    if (args.raw is None) != (args.start_va is None):
+        raise ValueError("--raw and --start-va must be supplied together")
+    if args.raw is None and (args.module_base is not None or args.module_size is not None):
+        raise ValueError("--module-base and --module-size require --raw")
+    if args.raw:
+        source = raw_source(
+            args.raw, args.start_va, module_base=args.module_base, module_size=args.module_size
+        )
+    else:
+        source = PE(args.file)
+    if args.command == "info":
+        result = {}
+        if isinstance(source, PE):
+            result = {
+                "sections": source.sections,
+                "imports": limited(source.imports.values(), args.limit),
+                "exports": limited(source.exports, args.limit),
+                "unwind_entry_count": len(source.entries),
+            }
+    elif args.command == "find":
+        result = search(
+            source,
+            text=args.text,
+            encoding=args.encoding,
+            pattern=args.pattern,
+            value=args.value,
+            value_type=args.type,
+            limit=args.limit,
+            scope={"section": args.section, "start": args.start, "length": args.length},
+        )
+    elif args.command == "refs":
+        result = references(
+            source,
+            address=args.address,
+            displacement=args.displacement,
+            kind=args.kind,
+            limit=args.limit,
+            scope={"section": args.section, "start": args.start, "length": args.length},
+        )
+    elif args.command == "disasm":
+        result = disassemble(
+            source, args.address, byte_count=args.bytes, unwind=args.unwind, limit=args.limit
+        )
+    elif args.command == "data":
+        result = read_data(source, args.address, args.type, args.count)
+    else:
+        result = rtti(source, args.name, slots=args.slots, slot_start=args.slot_start, limit=args.limit)
+    report = {
+        "tool": {
+            "name": "static-byte-inspector",
+            "capstone": version("capstone"),
+            "pefile": pefile.__version__,
+        },
+        "command": args.command,
+        "source": source.metadata,
+        **result,
+    }
+    if isinstance(source, PE):
+        report["pe_warnings"] = source.pe.get_warnings()
+    return report
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        report = run(args)
+        output = json.dumps(report, indent=2, ensure_ascii=True, allow_nan=False)
+    except (OSError, ValueError, struct.error, OverflowError, pefile.PEFormatError, capstone.CsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    print(output)
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

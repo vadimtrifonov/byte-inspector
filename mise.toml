@@ -12,12 +12,12 @@ _.python.venv = { path = ".venv", create = true, uv_create_args = ["--seed"] }
 auto = true
 
 [tasks.inspector]
-description = "Run Runtime Byte Inspector"
-run = "python -m scripts"
+description = "Run Static Byte Inspector"
+run = "python -B -m scripts"
 
 [tasks.test]
-description = "Run contract and Windows integration tests"
-run = "python -m unittest discover -s tests -v"
+description = "Run offline regression tests"
+run = "python -B -m unittest discover -s tests -v"
 
 [tasks.check]
 description = "Check Python formatting and lint rules"
@@ -25,7 +25,3 @@ run = [
   "ruff format --check scripts tests",
   "ruff check scripts tests",
 ]
-
-[tasks.format]
-description = "Format Python source and tests"
-run = "ruff format scripts tests"

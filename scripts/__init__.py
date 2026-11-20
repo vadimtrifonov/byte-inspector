@@ -1,1 +1,1 @@
-"""Bounded PE and live-process byte captures."""
+"""Offline AMD64 byte and PE inspection."""
