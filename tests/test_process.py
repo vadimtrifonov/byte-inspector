@@ -134,6 +134,12 @@ class ProcessTests(unittest.TestCase):
                 ],
             ),
         )
+        # A listing that goes on past the jump shows the cell as the address it is, not as instructions.
+        code, lines, _ = self.in_python("disasm", f"va:{page:#x}", "--bytes", "14")
+        self.assertEqual(
+            (lines[1].rpartition("  instructions ")[2], lines[3]),
+            ("1  pointers 1", f"va:{page + 6:#x}  pointer  points to {there}"),
+        )
         # So is a jump through a cell in other memory; a cell nobody may read says that it is one.
         code, lines, _ = self.in_python(
             "disasm", f"va:{page + 0x20:#x}", f"va:{page + 0x30:#x}", "--bytes", "6"

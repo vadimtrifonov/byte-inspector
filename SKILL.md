@@ -121,16 +121,21 @@ rva:0x2feee3  vmovss dword ptr [rbx + 0x7c], xmm0
 
 Without options, a listing covers up to 256 bytes from the address.
 `--bytes N` sets the byte count (up to 1 MiB); `--function` lists the whole function that holds the address, piece by piece.
+A listing shows at most `--limit` instructions, so a function longer than the default 100 needs a higher limit.
 `--before N` starts the listing N bytes before the address, which shows how the values an instruction uses were set.
+Where unwind data covers the address, decoding starts again at the start of its function, or of the piece that holds it, so bytes before the function that are not code cannot put the listing out of step.
 `--show-bytes` adds each instruction's bytes, for signatures and patch sizes.
 
 Where unwind data covers the address, a listing starts at the instruction that holds it; the summary says `inside instruction rva:…` when that moved the start back.
 Elsewhere decoding starts at the given byte.
 With `--before`, such a start can be inside an instruction; the summary ends with a `note` when decoding then does not arrive at the address.
-Decoding is linear and does not stop at a return, so data that lies in code, such as a jump table or a stored address, is printed as instructions.
+Decoding is linear and does not stop at a return, so data that lies in code, such as a jump table, is printed as instructions.
+The exception is the eight bytes that a call or jump in the listing reads its destination from, as after `jmp qword ptr [rip]`.
+They are one `pointer` row that says where they point, and the summary counts them as `pointers`.
 When decoding stops before the end of a range or piece, the summary says where and why.
 
 `target` gives the address a memory operand refers to and what it holds.
+`no bytes in file` marks an address in the image that the file stores no bytes for, such as uninitialized data.
 For an instruction that reads one float from a read-only section, `target` also gives that value as `f32` or `f64`.
 A direct call or jump has a `target` only when its destination is exported, is an import stub, or is outside the image.
 `export Name +N` counts the other names the address is exported by.

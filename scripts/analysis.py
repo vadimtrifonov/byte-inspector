@@ -27,6 +27,7 @@ FORMATS = {
     "pointer": "Q",
 }
 STUB_JUMPS = (b"\xff\x25", b"\x48\xff\x25")  # jmp qword ptr [rip + disp32], without and with REX.W
+RIP_CELL = re.compile(r"qword ptr \[rip(?: ([+-]) (\w+))?\]")  # the operand of a call or jump through a cell
 STRING_SHOWN = 120  # characters of a string shown beside an address
 MATCH_SHOWN = 256  # characters of a string shown around a text match
 TEXT = rb"[\t\n\r\x20-\x7e]"
@@ -565,13 +566,18 @@ class Inspector:
             begin = first if begin is None else begin
             ranges = [(begin, va + byte_count)]
             summary["range"] = self._range(*ranges[0])
+            # What precedes the code that holds the address may not be code. Decoding starts again where that
+            # code starts, so that nothing before it can put the listing out of step.
+            start = self.functions.piece_start(va) if before else None
+            if start is not None and begin < start:
+                ranges = [(begin, start), (start, va + byte_count)]
             summary.update(self.code_facts(va))
             inside = self.functions.instruction_at(va)
             if inside is not None and inside != va:
                 summary["inside_instruction"] = source.show(inside)
         if not 0 < size <= MAX_DECODE_BYTES:
             raise ValueError(f"Disassembly ranges must be 1..{MAX_DECODE_BYTES} bytes")
-        rows, total, stops = [], 0, {}
+        rows, total, pointers, stops = [], 0, 0, {}
 
         def stop(reason, at):
             if source.show(at) not in stops.setdefault(reason, []):
@@ -589,10 +595,15 @@ class Inspector:
             raw = source.read(begin, end - begin)
             decoded = begin
             reached = function or begin == va or "inside_instruction" in summary
-            for at, size, _, _ in self.functions.lite.disasm_lite(raw, begin):
+            cells = []
+            for at, size in self._instructions(raw, begin, cells):
                 total += 1
                 decoded = at + size
                 reached = reached or at == va
+            if cells:
+                pointers += len(cells)
+                decoded = max(decoded, cells[-1] + 8)
+                reached = reached or any(cell <= va < cell + 8 for cell in cells)
             if not reached and decoded > va:
                 summary["note"] = (
                     f"decoding from {source.show(begin)} does not arrive at {source.show(va)} as the start of an "
@@ -600,11 +611,55 @@ class Inspector:
                 )
             if decoded < end:
                 stop(*self._stopped(decoded, end))
-            if len(rows) < limit:
-                for ins in self.decoder.disasm(raw, begin, count=limit - len(rows)):
+            at = begin
+            for cell in [*cells, end]:
+                if len(rows) >= limit:
+                    break
+                code = raw[at - begin : cell - begin]
+                for ins in self.decoder.disasm(code, at, count=limit - len(rows)):
                     rows.append(self.instruction(ins, show_bytes=show_bytes))
-        summary.update(counted(total, rows, "instructions"), **stops)
+                if cell == end or len(rows) >= limit:
+                    break
+                rows.append(self._stored_address(cell, raw[cell - begin : cell - begin + 8], show_bytes))
+                at = cell + 8
+        summary["instructions"] = total
+        if pointers:
+            summary["pointers"] = pointers
+        if total + pointers > len(rows):
+            summary["showing"] = len(rows)
+        summary.update(stops)
         return [(summary, rows)]
+
+    def _instructions(self, raw, begin, cells):
+        """The address and size of each instruction in a range, in order.
+
+        The eight bytes from which a call or jump in the range reads its destination hold an address, not
+        instructions: decoding steps over them, and `cells` receives where they are.
+        """
+        end = begin + len(raw)
+        ahead = set()
+        at = begin
+        while at < end:
+            for start, size, mnemonic, operands in self.functions.lite.disasm_lite(raw[at - begin :], at):
+                yield start, size
+                at = start + size
+                found = mnemonic in ("jmp", "call") and RIP_CELL.fullmatch(operands)
+                if found:
+                    cell = at + int((found[1] or "") + (found[2] or "0"), 0)
+                    if at <= cell <= end - 8:
+                        ahead.add(cell)
+                if at in ahead:
+                    break
+            else:
+                return
+            cells.append(at)
+            at += 8
+
+    def _stored_address(self, va, raw, show_bytes):
+        row = {"address": self.source.show(va)}
+        if show_bytes:
+            row["bytes"] = raw.hex(" ")
+        return {**row, "pointer": True, "points_to": self.held(struct.unpack("<Q", raw)[0])}
 
     def _stopped(self, va, end):
         """Why decoding a range stopped at `va` before its `end`, and the address that reason is about."""

@@ -123,6 +123,29 @@ class Functions:
                 pieces.append([begin, end])
         return Function(source.base + root[0], tuple((source.base + a, source.base + b) for a, b in pieces))
 
+    def piece_start(self, va):
+        """Where the piece of its function that unwind data places this address in begins, or None.
+
+        A piece is a run of entries of one function with no gap between them.
+        """
+        source = self.source
+        entry = source.owner(va)
+        if entry is None:
+            return None
+        entries = source.entries
+        index = bisect.bisect_right(source.starts, entry[0]) - 1
+        try:
+            root = self._root(entry)[0]
+            while (
+                index
+                and entries[index - 1][1] == entries[index][0]
+                and self._root(entries[index - 1])[0] == root
+            ):
+                index -= 1
+        except ValueError:  # a chain that cannot be followed ends the run
+            pass
+        return source.base + entries[index][0]
+
     # Instruction boundaries
 
     @lru_cache(maxsize=128)

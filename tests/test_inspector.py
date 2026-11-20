@@ -612,12 +612,43 @@ class InspectorTests(unittest.TestCase):
         self.assertEqual(
             one(disasm("rva:0x1002", before=0x40, byte_count=5))[0]["range"], "rva:0x1000..rva:0x1007"
         )
+        # Bytes before the function that are not code do not put the listing out of step: here they
+        # start an instruction that would take in the first one of the function.
+        swallowing = self.patched({0x107E: b"\x48\xb8"}, "swallowing.dll").disasm
+        summary, rows = one(swallowing("rva:0x1085", before=7, byte_count=1))
+        self.assertEqual(
+            (summary["range"], addresses(rows), summary["ends_inside_instruction"]),
+            ("rva:0x107e..rva:0x1086", ["rva:0x1080", "rva:0x1085"], ["rva:0x107e"]),
+        )
+        self.assertNotIn("note", summary)
         # Without unwind data they are decoded from the byte asked for, which can miss the address.
         summary, rows = one(disasm("rva:0x10a5", before=3, byte_count=1))
         self.assertEqual(addresses(rows), ["rva:0x10a2", "rva:0x10a4"])
         self.assertIn("does not arrive at rva:0x10a5", summary["note"])
         with self.assertRaises(ValueError):
             disasm("rva:0x1016", before=5, function=True)
+
+    def test_an_address_that_a_jump_reads_from_the_code_is_listed_as_a_pointer(self):
+        cell, text = struct.pack("<Q", BASE + 0x1050), struct.pack("<Q", BASE + 0x2040)
+        # jmp [rip], its cell; call [rip + 2], a jump over the cell, the cell; ret.
+        code = bytes.fromhex("ff2500000000") + cell + bytes.fromhex("ff1502000000 eb08") + text + b"\xc3"
+        disasm = self.patched({0x1100: code}).disasm
+        summary, rows = one(disasm("rva:0x1100", byte_count=len(code), show_bytes=True))
+        self.assertEqual(
+            addresses(rows),
+            ["rva:0x1100", "rva:0x1106", "rva:0x110e", "rva:0x1114", "rva:0x1116", "rva:0x111e"],
+        )
+        self.assertEqual((summary["instructions"], summary["pointers"]), (4, 2))
+        self.assertEqual(
+            (rows[1]["bytes"], rows[1]["pointer"], rows[1]["points_to"]["address"]),
+            ("50 10 00 40 01 00 00 00", True, "rva:0x1050"),
+        )
+        self.assertEqual(rows[4]["points_to"], {"address": "rva:0x2040", "string": "AnchorName"})
+        self.assertEqual(rows[5]["instruction"], "ret")
+        summary, rows = one(disasm("rva:0x1100", byte_count=len(code), limit=2))
+        self.assertEqual((addresses(rows), summary["showing"]), (["rva:0x1100", "rva:0x1106"], 2))
+        # A cell that the range cuts short is not one.
+        self.assertNotIn("pointers", one(disasm("rva:0x1100", byte_count=10))[0])
 
     def test_a_saved_copy_of_a_loaded_module_answers_as_its_file_does(self):
         mod = 0x7FF800000000
