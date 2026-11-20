@@ -1,34 +1,40 @@
-# Static Byte Inspector
+# Byte Inspector
 
-Static Byte Inspector is a command-line tool for inspecting x86-64 code and data in PE files and raw byte files.
-It searches for strings, byte patterns, and references, and displays disassembly or data at selected addresses.
-Inspection is offline and read-only.
+Byte Inspector is a command-line tool for reading x86-64 code and data in Windows PE executables and DLLs.
+It disassembles functions, finds references, strings, and byte patterns, and says what an address holds.
 
-## Input files
+## Output
 
-A **PE file** supplies bytes from a Windows x64 executable or DLL, along with its sections, imports, exports, and unwind metadata.
-Addresses in the file use its preferred image base, which can differ from the address where it is loaded at runtime.
+Results are text lines: a summary for each query, then one result per line, each starting with an address.
+Printed addresses are valid input, so a command accepts several addresses at once and can read another command's lines from standard input.
+`--jsonl` prints the same facts as JSON records.
 
-A **raw byte file** contains bytes without headers, such as a saved memory range.
-Its starting virtual address must be supplied so instruction targets and references can be calculated.
-An optional module base and size enable module-relative addresses (RVAs).
+Addresses inside the image are relative to its base (`rva:`), so they stay the same wherever the image is loaded.
 
 ## Commands
 
 | Command | Input | Output |
 |---|---|---|
-| `info` | Any supported input file | Source identity and available PE metadata |
-| `find` | String, byte pattern, or number | Matching locations and match counts |
-| `refs` | Address or memory-operand offset | Candidate code references, stored pointers, or matching memory operands |
-| `disasm` | Address and range | Instructions with branch targets and data-reference annotations |
-| `data` | Address and data type | Typed values or pointer targets |
-| `rtti` | MSVC C++ type name in a PE file | Candidate virtual function tables, subobject offsets, and selected slots |
+| `info` | – | File identity, sections with entropy, imports, exports |
+| `find` | Text, byte patterns, or numbers | Matches; for text, the string around each match |
+| `refs` | Addresses, or a memory displacement | Instructions and stored pointers that refer to each address |
+| `disasm` | Addresses | Instructions in a byte range or in the whole function |
+| `data` | Addresses and a type | Values, or a pointer table with what each pointer refers to |
+| `rtti` | Class names | Virtual function tables and their slots |
+| `describe` | Addresses | The function, class slots, string, import, or export at each address |
 
-Results are JSON and include source hashes to identify the input.
-Reference searches distinguish validated instruction boundaries from unverified byte matches.
+## Functions
 
-Disassembly can use an explicit byte count or ranges from PE unwind metadata, which Windows uses for exception handling.
-These ranges can cover parts of functions rather than whole functions.
+Windows unwind data records where functions are; it can split one function into pieces that lie far apart.
+Byte Inspector treats all pieces that belong to one start as one function.
+Functions that the unwind data omits get an estimated extent, labelled with the evidence for it.
+
+## Encrypted code
+
+Some executables keep their code encrypted or compressed on disk.
+Their strings and data still read normally, while disassembly is meaningless and reference searches come back empty.
+Byte Inspector measures the entropy of the largest code section and adds a warning to every summary when it is above 7.0 bits per byte.
+The measure is a heuristic: a missing warning does not prove the code is plain.
 
 ## Getting started
 

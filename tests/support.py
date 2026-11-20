@@ -4,7 +4,8 @@ from pathlib import Path
 BASE = 0x140000000
 
 
-def fixture(path):
+def fixture(path, patches=None):
+    """A small PE image; `patches` maps an RVA to bytes written over the finished image."""
     data = bytearray(0x1200)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x80)
@@ -48,9 +49,13 @@ def fixture(path):
     put(0x1040, rel(0x1040, b"\xe8", 0x1050))
     put(0x1050, rel(0x1050, b"\xff\x15", 0x2190) + b"\xc3")
     put(0x1060, rel(0x1060, b"\x2e\xe8", 0x1050) + b"\xc3")
+    # A separated piece of the function at 0x1000, then two functions without unwind data.
+    put(0x1080, rel(0x1080, b"\xe8", 0x10A0) + b"\xc3")
+    put(0x10A0, b"\xb8\x01\0\0\0\xc3")
+    put(0x10B0, b"\x31\xc0\xc3")
     put(0x2040, b"AnchorName\0")
     put(0x2060, "WideName\0".encode("utf-16le"))
-    put(0x2080, struct.pack("<QQ", BASE + 0x1050, BASE + 0x2040))
+    put(0x2080, struct.pack("<QQQ", BASE + 0x1050, BASE + 0x2040, BASE + 0x10A0))
     # One ordinary import.
     struct.pack_into("<II", data, opt + 112 + 8, 0x2100, 40)
     put(0x2100, struct.pack("<5I", 0x2180, 0, 0, 0x2150, 0x2190))
@@ -63,12 +68,14 @@ def fixture(path):
     put(0x2210, b"\x21\0\x01\0\0\0\0\0" + struct.pack("<III", 0x1000, 0x1020, 0x2200))
     for rva in (0x2230, 0x2240, 0x2250):
         put(rva, b"\x01\0\0\0")
+    put(0x2260, b"\x21\0\0\0" + struct.pack("<III", 0x1000, 0x1020, 0x2200))
     entries = [
         (0x1000, 0x1020, 0x2200),
         (0x1020, 0x1030, 0x2210),
         (0x1030, 0x1040, 0x2230),
         (0x1050, 0x1060, 0x2240),
         (0x1060, 0x1070, 0x2250),
+        (0x1080, 0x1090, 0x2260),
     ]
     put(0x3000, b"".join(struct.pack("<III", *entry) for entry in entries))
     struct.pack_into("<II", data, opt + 112 + 3 * 8, 0x3000, len(entries) * 12)
@@ -88,6 +95,8 @@ def fixture(path):
     put(0x2480, struct.pack("<4I", 0, 0, 1, 0x2490))
     put(0x2500, struct.pack("<QQQ", BASE + 0x2440, BASE + 0x1050, 0))
     put(0x2540, struct.pack("<QQQQ", BASE + 0x2460, BASE + 0x1050, BASE + 0x1000, 0))
+    for rva, raw in (patches or {}).items():
+        put(rva, raw)
     data.extend(b"OverlayAnchor\0")
     Path(path).write_bytes(data)
     return Path(path)

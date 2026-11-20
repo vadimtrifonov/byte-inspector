@@ -1,1 +1,1 @@
-"""Offline AMD64 byte and PE inspection."""
+"""Inspection of AMD64 code and data in PE files."""

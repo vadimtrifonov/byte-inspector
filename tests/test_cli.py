@@ -1,311 +1,285 @@
+import contextlib
 import io
 import json
-import os
+import random
+import subprocess
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from support import BASE, ok_result, saved_capture, write_pe
+from support import fixture
 
 from scripts.__main__ import main
+from scripts.output import line
+from scripts.sources import coordinate
+
+ROOT = Path(__file__).resolve().parents[1]
+COMMANDS = [
+    ["info"],
+    ["find", "--text", "Anchor", "--text", "WideName", "--encoding", "both"],
+    ["find", "--pattern", "48 8D ?? ?? ?? ?? ??"],
+    ["refs", "rva:0x1050", "rva:0x2040"],
+    ["refs", "--displacement", "0x3F4"],
+    ["disasm", "rva:0x1028", "--function"],
+    ["disasm", "rva:0x1000", "--bytes", "32", "--show-bytes"],
+    ["data", "rva:0x2080", "--type", "pointer", "--count", "3"],
+    ["data", "offset:0x1200", "--count", "14"],
+    ["rtti", "Widget", "--slots", "4"],
+    ["describe", "rva:0x1050", "rva:0x10a2", "rva:0x2550", "rva:0x2040"],
+]
 
 
-@unittest.skipUnless(os.name == "nt", "Windows capture publication")
-class CliTests(unittest.TestCase):
+class CommandLineTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
+        temporary = tempfile.TemporaryDirectory(prefix="byte-inspector-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.image = write_pe(self.root / "image.exe")
+        self.path = fixture(self.root / "fixture.dll")
 
-    def run_cli(self, *args):
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            status = main([str(arg) for arg in args])
-        return status, stdout.getvalue(), stderr.getvalue()
-
-    def test_inspect_and_target_list_capture_round_trip_through_comparison(self):
-        status, output, errors = self.run_cli(
-            "inspect",
-            "--file",
-            self.image,
-            "--rva",
-            "0x1000",
-            "--before",
-            0,
-            "--after",
-            1,
-            "--format",
-            "json",
-        )
-        self.assertEqual((status, errors), (0, ""))
-        inspected = json.loads(output)
-        self.assertEqual(inspected["results"][0]["read"]["bytes_hex"], "90C3")
-        self.assertEqual(inspected["tool"]["name"], "runtime-byte-inspector")
-        target_list = self.root / "targets.json"
-        target_list.write_text(
-            json.dumps(
-                {
-                    "targets": [
-                        {"label": "site", "rva": "0x1000", "group": "code"},
-                        {"label": "header", "rva": 0, "group": "headers"},
-                    ],
-                }
-            ),
-            encoding="utf-8-sig",
-        )
-        destination = self.root / "capture.json"
-        status, output, errors = self.run_cli(
-            "capture",
-            "--file",
-            self.image,
-            "--targets",
-            target_list,
-            "--group",
-            "code",
-            "--before",
-            0,
-            "--after",
-            1,
-            "--output",
-            destination,
-        )
-        self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(output.strip(), str(destination.resolve()))
-        captured = json.loads(destination.read_text(encoding="utf-8"))
-        self.assertEqual(captured["request"]["target_list"]["path"], str(target_list.resolve()))
-        self.assertEqual(len(captured["request"]["target_list"]["sha256"]), 64)
-        self.assertEqual(captured["request"]["groups"], ["code"])
-        self.assertEqual(captured["summary"]["target_count"], 1)
-        left = self.root / "inspected.json"
-        left.write_text(json.dumps(inspected), encoding="utf-8-sig")
-        status, output, errors = self.run_cli("compare", left, destination)
-        self.assertEqual((status, errors), (0, ""))
-        self.assertTrue(json.loads(output)["comparisons"][0]["windows_equal"])
-
-    def test_capture_saves_bytes_but_returns_nonzero_when_decoder_fails(self):
-        target_list = self.root / "targets.json"
-        target_list.write_text(
-            json.dumps({"targets": [{"label": "site", "rva": "0x1000"}]}),
-            encoding="utf-8",
-        )
-        destination = self.root / "capture.json"
-        with mock.patch("scripts.capture.decode", side_effect=RuntimeError("decoder failed")):
-            status, output, errors = self.run_cli(
-                "capture",
-                "--file",
-                self.image,
-                "--targets",
-                target_list,
-                "--before",
-                0,
-                "--after",
-                1,
-                "--output",
-                destination,
-            )
-        self.assertEqual(status, 1)
-        self.assertIn("decoder failed", errors)
-        self.assertEqual(output.strip(), str(destination.resolve()))
-        self.assertEqual(json.loads(destination.read_text())["results"][0]["read"]["bytes_hex"], "90C3")
-        exported = self.root / "decoded-failed.bin"
-        status, output, errors = self.run_cli("export", destination, "--label", "site", "--output", exported)
-        self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(exported.read_bytes(), b"\x90\xc3")
-
-    def test_export_preserves_the_whole_saved_window(self):
-        write_pe(self.image, b"\x90\xc3\x0f")
-        status, output, errors = self.run_cli(
-            "inspect",
-            "--file",
-            self.image,
-            "--rva",
-            "0x1001",
-            "--before",
-            1,
-            "--after",
-            1,
-            "--format",
-            "json",
-        )
-        self.assertEqual((status, errors), (0, ""))
-        capture = self.root / "capture.json"
-        capture.write_text(output, encoding="utf-16")
-        self.image.unlink()
-        destination = self.root / "code.bin"
-        status, output, errors = self.run_cli("export", capture, "--label", "site", "--output", destination)
-        self.assertEqual((status, errors), (0, ""))
-        report = json.loads(output)
-        self.assertEqual(destination.read_bytes(), b"\x90\xc3\x0f")
-        self.assertEqual(report["start_va"], hex(BASE + 0x1000))
-        self.assertEqual((report["module_base"], report["module_size"]), (hex(BASE), 0x2000))
-        self.assertEqual(report["byte_count"], 3)
-        self.assertEqual(report["output"], str(destination.resolve()))
-
-    def test_export_handles_private_va_pointer_cells_and_clipped_windows(self):
-        pointer = bytes(range(8))
-        cases = [
-            ({"label": "site", "va": "0x123001"}, {"start_va": "0x123000"}, b"\x90\xc3\x0f", 1, 1, 0x123000),
-            (
-                {"label": "site", "rva": "0x1000", "kind": "pointer"},
-                {"start_rva": "0x1000"},
-                pointer,
-                32,
-                64,
-                BASE + 0x1000,
-            ),
-            ({"label": "site", "rva": "0x0"}, {"start_rva": "0x0"}, b"\x90" * 65, 32, 64, BASE),
-        ]
-        capture, destination = self.root / "capture.json", self.root / "range.bin"
-        for target, address, raw, before, after, start in cases:
-            with self.subTest(target=target):
-                result = {"target": target, "read": {"status": "ok", "bytes_hex": raw.hex(), **address}}
-                capture.write_text(json.dumps(saved_capture([result], before=before, after=after)))
-                status, output, errors = self.run_cli(
-                    "export",
-                    capture,
-                    "--label",
-                    "site",
-                    "--output",
-                    destination,
-                    "--overwrite",
-                )
-                self.assertEqual((status, errors), (0, ""))
-                report = json.loads(output)
-                self.assertEqual(destination.read_bytes(), raw)
-                self.assertEqual(report["start_va"], hex(start))
-                self.assertEqual(report["byte_count"], len(raw))
-                self.assertEqual("module_base" in report, "rva" in target)
-
-    def test_export_failures_have_no_stdout_and_preserve_existing_files(self):
-        capture, destination = self.root / "capture.json", self.root / "range.bin"
-        payload = saved_capture(
-            [
-                ok_result("site", b"\x90\xc3"),
-                {
-                    "target": {"label": "failed", "rva": "0x1000"},
-                    "read": {"status": "error", "error": {"message": "unreadable"}},
-                },
-            ]
-        )
-        capture.write_text(json.dumps(payload))
-        destination.write_bytes(b"existing bytes")
-        command = ("export", capture, "--output", destination, "--overwrite")
-        for label in ("absent", "failed"):
-            with self.subTest(label=label):
-                status, output, errors = self.run_cli(*command, "--label", label)
-                self.assertEqual((status, output), (1, ""))
-                self.assertIn(label, errors)
-                self.assertEqual(destination.read_bytes(), b"existing bytes")
-        payload["results"][0]["read"]["bytes_hex"] = "90"
-        capture.write_text(json.dumps(payload))
-        status, output, errors = self.run_cli(*command, "--label", "site")
-        self.assertEqual((status, output), (1, ""))
-        self.assertIn("Invalid capture", errors)
-        self.assertEqual(destination.read_bytes(), b"existing bytes")
-
-    def test_export_requires_overwrite_and_never_replaces_its_input(self):
-        capture, destination = self.root / "capture.json", self.root / "range.bin"
-        capture.write_text(json.dumps(saved_capture([ok_result("site", b"\x90\xc3")])))
-        original = capture.read_bytes()
-        command = ("export", capture, "--label", "site", "--output", destination)
-        destination.write_bytes(b"existing bytes")
-        status, output, errors = self.run_cli(*command)
-        self.assertEqual((status, output), (1, ""))
-        self.assertEqual(destination.read_bytes(), b"existing bytes")
-        status, output, errors = self.run_cli(*command, "--overwrite")
-        self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(destination.read_bytes(), b"\x90\xc3")
-        alias = self.root / "alias.json"
-        alias.hardlink_to(capture)
-        for output_path in (capture, alias):
-            with self.subTest(output_path=output_path):
-                status, output, errors = self.run_cli(
-                    "export",
-                    capture,
-                    "--label",
-                    "site",
-                    "--output",
-                    output_path,
-                    "--overwrite",
-                )
-                self.assertEqual((status, output), (1, ""))
-                self.assertIn("must not be the input capture", errors)
-                self.assertEqual(capture.read_bytes(), original)
-        self.assertFalse(list(self.root.glob("*.tmp")))
-
-    def test_text_inspection_derives_instruction_markers_and_undecoded_tail(self):
-        write_pe(self.image, bytes.fromhex("01 FF 15 E0 67 ED FF 45 33 C0"))
-        for decode_args, marker in (((), ">>"), (("--decode-rva", "0x1000"), "*>")):
-            with self.subTest(decode_args=decode_args):
-                status, output, errors = self.run_cli(
-                    "inspect",
-                    "--file",
-                    self.image,
-                    "--rva",
-                    "0x1001",
-                    "--before",
-                    1,
-                    "--after",
-                    8,
-                    *decode_args,
-                )
-                self.assertEqual((status, errors), (0, ""))
-                self.assertTrue(any(line.startswith(marker) for line in output.splitlines()))
-        write_pe(self.image, b"\xc3\x0f")
-        status, output, errors = self.run_cli(
-            "inspect", "--file", self.image, "--rva", "0x1000", "--before", 0, "--after", 1
-        )
-        self.assertEqual((status, errors), (0, ""))
-        self.assertIn("raw context after block from 0x140001001: 0F", output)
-        write_pe(self.image, b"\x90\x0f")
-        status, output, errors = self.run_cli(
-            "inspect", "--file", self.image, "--rva", "0x1000", "--before", 0, "--after", 1
-        )
-        self.assertEqual((status, errors), (0, ""))
-        self.assertIn("undecoded from 0x140001001: 0F", output)
-
-    def test_file_va_and_decoding_origin_remain_preferred_image_relative(self):
-        write_pe(self.image, bytes.fromhex("488BC45741544155415641574883EC40C3"))
-        status, output, errors = self.run_cli(
-            "inspect",
-            "--file",
-            self.image,
-            "--va",
-            "0x140001000",
-            "--decode-va",
-            "0x140001000",
-            "--before",
-            0,
-            "--after",
-            16,
-            "--span",
-            16,
-            "--format",
-            "json",
-        )
-        self.assertEqual((status, errors), (0, ""))
-        result = json.loads(output)["results"][0]
-        self.assertEqual(result["target"]["rva"], "0x1000")
-        self.assertEqual(result["span"]["end_status"], "boundary")
-        self.assertEqual(result["span"]["relative_instructions"], [])
-
-    def test_invalid_source_options_and_invalid_captures_have_no_stdout(self):
-        for args in (
-            ("inspect", "--file", self.image, "--module", "other.dll", "--rva", 0),
-            ("inspect", "--file", self.image, "--patch-state", "unpatched", "--rva", 0),
-            ("inspect", "--file", self.image, "--va", 1),
-            ("inspect", "--file", self.image, "--rva", "0x1000", "--pointer"),
-            ("inspect", "--file", self.image, "--rva", "0x1000", "--follow", 1),
-            ("inspect", "--file", self.image, "--rva", "0x1000", "--span", 0),
-            ("inspect", "--file", self.image, "--rva", "0x1000", "--span", 66),
-            ("inspect", "--file", self.image, "--rva", "0x1000", "--decode-va", "0x140001000"),
-            ("compare", self.image, self.image),
-            ("compare", self.root, self.root),
+    def run_cli(self, *arguments, stdin="", path=None):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            mock.patch("sys.stdin", io.StringIO(stdin)),
         ):
-            with self.subTest(args=args):
-                status, output, errors = self.run_cli(*args)
-                self.assertEqual((status, output), (1, ""))
-                self.assertIn("error:", errors)
+            try:
+                code = main([*arguments, "--file", str(path or self.path)])
+            except SystemExit as exit:
+                code = exit.code
+        return code, out.getvalue().splitlines(), err.getvalue()
+
+    def test_every_result_line_leads_with_an_address_the_tool_accepts(self):
+        printed = []
+        for command in COMMANDS:
+            code, lines, err = self.run_cli(*command)
+            with self.subTest(command=command):
+                self.assertEqual((code, err), (0, ""))
+                self.assertTrue(lines[0].startswith(f"# {command[0]} "))
+                for text in lines:
+                    if not text.startswith("#"):
+                        coordinate(text.split()[0])
+                        self.assertIn("  ", text)
+                printed += lines
+        # Every line the tool printed is valid input: addresses are answered, summaries pass through.
+        code, lines, err = self.run_cli("describe", "-", stdin="\n".join(printed))
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse([text for text in lines if text.startswith("error:")])
+        passed = [text for text in printed if text.startswith("#") and not text.startswith("# describe")]
+        self.assertEqual(
+            [text for text in lines if text.startswith("#") and not text.startswith("# describe")], passed
+        )
+
+    def test_jsonl_states_the_same_facts_as_the_lines(self):
+        for command in COMMANDS:
+            _, lines, _ = self.run_cli(*command)
+            code, records, err = self.run_cli(*command, "--jsonl")
+            with self.subTest(command=command):
+                self.assertEqual((code, err), (0, ""))
+                records = [json.loads(text) for text in records]
+                for record in records:
+                    if record["record"] == "summary":
+                        self.assertEqual(record["file"], str(self.path.resolve()))
+                        self.assertEqual(len(record["sha256"]), 64)
+                        if command[0] != "info" or record["query"] != "sections":
+                            del record["file"], record["sha256"]
+                self.assertEqual([line(record) for record in records], lines)
+
+    def test_each_address_is_answered_alone_with_its_own_limit(self):
+        code, lines, _ = self.run_cli("refs", "rva:0x1050", "rva:0x2040", "--limit", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [text.split("  ")[:3] for text in lines if text.startswith("#")],
+            [
+                ["# refs rva:0x1050", "results 6", "showing 2"],
+                ["# refs rva:0x2040", "results 4", "showing 2"],
+            ],
+        )
+        self.assertEqual([text.startswith("#") for text in lines], [True, False, False, True, False, False])
+
+    def test_a_failed_address_is_reported_in_place_and_the_rest_are_answered(self):
+        code, lines, err = self.run_cli(
+            "data", "rva:0x2040", "rva:0x1400", "bogus", "rva:0x2060", "--count", "4"
+        )
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(
+            [text.split("  ")[0] for text in lines],
+            [
+                "# data rva:0x2040",
+                "rva:0x2040",
+                "error: rva:0x1400: No bytes in the file at rva:0x1400",
+                "error: bogus: Not an address: bogus (use rva:0x1000, va:0x140001000, or offset:0x400)",
+                "# data rva:0x2060",
+                "rva:0x2060",
+            ],
+        )
+        code, records, _ = self.run_cli("data", "rva:0x1400", "--jsonl")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(records[0])["record"], "error")
+        # A file offset that is loaded is read as its address: both of these run past the end of .text.
+        code, lines, _ = self.run_cli("data", "offset:0x7ff", "rva:0x13ff", "--count", "2")
+        self.assertEqual((code, [text.split(": ")[0] for text in lines]), (1, ["error", "error"]))
+
+    def test_a_listing_is_printed_once_per_call(self):
+        code, lines, _ = self.run_cli(
+            "disasm", "rva:0x1016", "rva:0x1085", "rva:0x1050", "rva:0x1000", "--function"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [text for text in lines if text.startswith("#")],
+            [
+                "# disasm rva:0x1016  function rva:0x1000  pieces rva:0x1000..rva:0x1030 rva:0x1080..rva:0x1090"
+                "  instructions 22",
+                "# disasm rva:0x1085  function rva:0x1000  listed under rva:0x1016",
+                "# disasm rva:0x1050  function rva:0x1050  export Exported  pieces rva:0x1050..rva:0x1060"
+                "  instructions 11",
+                "# disasm rva:0x1000  function rva:0x1000  listed under rva:0x1016",
+            ],
+        )
+        self.assertEqual(sum(text.startswith("rva:0x1000  ") for text in lines), 1)
+        _, records, _ = self.run_cli("disasm", "rva:0x1016", "rva:0x1085", "--function", "--jsonl")
+        self.assertEqual(json.loads(records[-1])["listed_under"], "rva:0x1016")
+
+    def test_commands_connect_through_text_lines(self):
+        _, callers, _ = self.run_cli("refs", "rva:0x2040", "--kind", "memory")
+        code, lines, err = self.run_cli("disasm", "-", "--function", "--limit", "1", stdin="\n".join(callers))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            lines,
+            [
+                callers[0],  # the earlier summary stays, so the history of the answer is visible
+                "# disasm rva:0x1000  function rva:0x1000  pieces rva:0x1000..rva:0x1030 rva:0x1080..rva:0x1090"
+                "  instructions 22  showing 1",
+                'rva:0x1000  lea rcx, [rip + 0x1039]  target rva:0x2040 string "AnchorName"',
+                "# disasm rva:0x1016  function rva:0x1000  listed under rva:0x1000",
+                "# disasm rva:0x1026  function rva:0x1000  listed under rva:0x1000",
+            ],
+        )
+        # Slot rows lead with functions; an address mixed with arguments keeps its place.
+        _, slots, _ = self.run_cli("rtti", "Widget", "--limit", "1")
+        _, lines, _ = self.run_cli("describe", "rva:0x2040", "-", stdin="\n".join(slots))
+        self.assertEqual(
+            [text.split("  ")[0] for text in lines if text.startswith("#")],
+            ["# describe rva:0x2040", "# rtti Widget", "# describe rva:0x1050", "# describe rva:0x1000"],
+        )
+
+    def test_a_record_is_one_line_whatever_the_query_holds(self):
+        path = fixture(self.root / "lines.dll", {0x2640: b"First\r\nSecond\0"})
+        code, found, _ = self.run_cli("find", "--text", "First\r\nSecond", path=path)
+        self.assertEqual(
+            found,
+            [
+                "# find First\\r\\nSecond  results 1  scanned bytes 4622",
+                'rva:0x2640  string "First\\r\\nSecond"  match +0',
+            ],
+        )
+        code, lines, err = self.run_cli("refs", "-", stdin="\n".join(found), path=path)
+        self.assertEqual((code, err, lines[0]), (0, "", found[0]))
+        code, lines, _ = self.run_cli("data", "rva:0x1\nrva:0x2")
+        self.assertEqual((code, len(lines)), (1, 1))
+
+    def test_input_lines_that_are_not_addresses(self):
+        stdin = "# a note\n\nrva:0x2040  text\nerror: rva:0x1: failed earlier\nsomething else\nrva:0x2060\n"
+        code, lines, err = self.run_cli("data", "-", "--count", "2", stdin=stdin)
+        self.assertEqual(
+            (code, err), (1, "")
+        )  # an error passed on, or a line that cannot be read, fails the call
+        self.assertEqual(
+            lines,
+            [
+                "# a note",
+                "# data rva:0x2040  type u8  count 2",
+                'rva:0x2040  41 6e  ascii "An"',
+                "error: rva:0x1: failed earlier",
+                "error: Not an address line: something else",
+                "# data rva:0x2060  type u8  count 2",
+                'rva:0x2060  57 00  ascii "W."',
+            ],
+        )
+        code, lines, err = self.run_cli("data", "-", stdin='{"record": "summary"}\nrva:0x2040\n')
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, ["error: Standard input is JSONL; pipe the default text lines instead"])
+        self.assertEqual(err.strip(), lines[0])
+
+    def test_a_failed_call_says_so_on_both_streams(self):
+        for arguments, path, expected in (
+            (["info"], self.root / "missing.dll", 1),
+            (["disasm", "rva:0x1000", "--limit", "0"], None, 1),
+            (["refs", "rva:0x1000", "--displacement", "8"], None, 1),
+            (["disasm"], None, 2),
+            (["find"], None, 2),
+        ):
+            code, lines, err = self.run_cli(*arguments, path=path)
+            with self.subTest(arguments=arguments):
+                self.assertEqual(code, expected)
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith("error: "))
+                self.assertEqual(err.strip(), lines[0])
+                self.assertNotIn("Traceback", err)
+
+    def test_every_summary_warns_when_code_looks_encrypted(self):
+        packed = fixture(self.root / "packed.dll", {0x1000: random.Random(7).randbytes(0x400)})
+        for command in (
+            ["refs", "rva:0x2040"],
+            ["data", "rva:0x2040"],
+            ["info"],
+            ["find", "--text", "Anchor"],
+        ):
+            _, lines, _ = self.run_cli(*command, path=packed)
+            _, records, _ = self.run_cli(*command, "--jsonl", path=packed)
+            _, clean, _ = self.run_cli(*command)
+            with self.subTest(command=command):
+                summaries = [text for text in lines if text.startswith("#")]
+                self.assertTrue(summaries)
+                for text in summaries:
+                    self.assertRegex(
+                        text, r"  warning code in \.text looks encrypted or compressed \(entropy 7\.\d\d\); "
+                    )
+                self.assertTrue(all("warning" in json.loads(text) for text in records if '"summary"' in text))
+                self.assertFalse([text for text in clean if "warning" in text])
+
+    def test_the_tool_runs_as_a_module_and_does_not_change_the_file(self):
+        before = self.path.read_bytes()
+        refs = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "scripts",
+                "refs",
+                "rva:0x2040",
+                "--kind",
+                "memory",
+                "--file",
+                self.path,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual((refs.returncode, refs.stderr), (0, ""))
+        listing = subprocess.run(
+            [sys.executable, "-B", "-m", "scripts", "disasm", "-", "--function", "--file", self.path],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            input=refs.stdout,
+        )
+        self.assertEqual((listing.returncode, listing.stderr), (0, ""))
+        self.assertEqual(listing.stdout.count("listed under rva:0x1000"), 2)
+        failed = subprocess.run(
+            [sys.executable, "-B", "-m", "scripts", "disasm", "rva:0x1400", "--file", self.path],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(failed.stdout.strip(), "error: rva:0x1400: No bytes in the file at rva:0x1400")
+        self.assertNotIn("Traceback", failed.stderr)
+        self.assertEqual(self.path.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

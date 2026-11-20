@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import math
 import struct
+from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -10,6 +12,8 @@ from pathlib import Path
 lazy import pefile
 
 ADDRESS_LIMIT = 1 << 64
+PACKED_ENTROPY = 7.0
+ENTROPY_SAMPLE = (64, 4096)
 
 
 def integer(value, *, signed=False):
@@ -22,73 +26,118 @@ def integer(value, *, signed=False):
 
 
 def coordinate(text):
+    mode, separator, value = text.partition(":")
+    if not separator or mode not in ("rva", "va", "offset"):
+        raise ValueError(f"Not an address: {text[:80]} (use rva:0x1000, va:0x140001000, or offset:0x400)")
     try:
-        mode, value = text.split(":", 1)
-    except ValueError as exc:
-        raise ValueError("Use an explicit address: rva:0x1000, va:0x140001000, or offset:0x400") from exc
-    if mode not in ("rva", "va", "offset"):
-        raise ValueError(f"Unknown address mode: {mode}")
-    return mode, integer(value)
+        return mode, integer(value)
+    except ValueError:
+        raise ValueError(f"Not an address: {text[:80]}") from None
 
 
 @dataclass(frozen=True)
 class Region:
+    """File bytes that are loaded at an address."""
+
     name: str
     offset: int
     size: int
     va: int
-    executable: bool | None = None
+    executable: bool
+    writable: bool
 
 
-class ByteSource:
-    def __init__(self, path, data, kind, regions, *, base=None, image_size=None):
+class PE:
+    def __init__(self, path):
         self.path = Path(path).resolve()
-        self.data = data
-        self.regions = regions
-        self.base = base
-        self.image_size = image_size
-        self.metadata = {
-            "kind": kind,
-            "path": str(self.path),
-            "byte_count": len(data),
-            "bytes_sha256": hashlib.sha256(data).hexdigest(),
-        }
-        if base is not None:
-            self.metadata.update(image_base=hex(base), image_size=image_size)
+        self.data = data = self.path.read_bytes()
+        self.pe = pe = pefile.PE(data=data, fast_load=True)
+        if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
+            raise ValueError("Only AMD64 PE32+ images are supported")
+        self.base = base = pe.OPTIONAL_HEADER.ImageBase
+        self.image_size = size = pe.OPTIONAL_HEADER.SizeOfImage
+        headers = pe.OPTIONAL_HEADER.SizeOfHeaders
+        if not 0 < headers <= len(data) or not headers <= size or base + size > ADDRESS_LIMIT:
+            raise ValueError("Invalid PE header/image bounds")
+        if len(pe.sections) != pe.FILE_HEADER.NumberOfSections:
+            raise ValueError("Truncated PE section table")
+        regions = [Region("headers", 0, headers, base, False, False)]
+        self.sections = []
+        for section in pe.sections:
+            name = section.Name.rstrip(b"\0").decode("ascii", errors="replace")
+            offset = section.get_PointerToRawData_adj()
+            rva = section.get_VirtualAddress_adj()
+            raw_size = section.SizeOfRawData
+            self.sections.append(
+                {
+                    "name": name,
+                    "rva": rva,
+                    "virtual_size": section.Misc_VirtualSize,
+                    "offset": offset,
+                    "raw_size": raw_size,
+                    "characteristics": section.Characteristics,
+                }
+            )
+            if not raw_size:
+                continue
+            if offset + raw_size > len(data) or rva + raw_size > size:
+                raise ValueError("Truncated or out-of-image PE section")
+            flags = section.Characteristics
+            regions.append(
+                Region(name, offset, raw_size, base + rva, bool(flags & 0x20000000), bool(flags & 0x80000000))
+            )
+        self.regions = sorted(regions, key=lambda r: r.va)
+        self._by_offset = sorted(regions, key=lambda r: r.offset)
+        for ordered, key in ((self.regions, "va"), (self._by_offset, "offset")):
+            if any(getattr(a, key) + a.size > getattr(b, key) for a, b in zip(ordered, ordered[1:])):
+                raise ValueError("Overlapping PE regions are unsupported")
+        self._vas = [r.va for r in self.regions]
+        self._offsets = [r.offset for r in self._by_offset]
 
-    @cached_property
-    def imports(self):
-        return {}
+    # Addresses
 
-    def owner(self, va):
+    def show(self, va):
+        """The address as printed and accepted: relative to the image when inside it."""
+        if self.base <= va < self.base + self.image_size:
+            return f"rva:{va - self.base:#x}"
+        return f"va:{va:#x}"
+
+    def show_offset(self, offset):
+        region = self.region_of_offset(offset)
+        return self.show(region.va + offset - region.offset) if region else f"offset:{offset:#x}"
+
+    def region_of(self, va):
+        index = bisect.bisect_right(self._vas, va) - 1
+        if index >= 0 and va < self.regions[index].va + self.regions[index].size:
+            return self.regions[index]
         return None
+
+    def region_of_offset(self, offset):
+        index = bisect.bisect_right(self._offsets, offset) - 1
+        if index >= 0 and offset < self._by_offset[index].offset + self._by_offset[index].size:
+            return self._by_offset[index]
+        return None
+
+    def region_at(self, va):
+        region = self.region_of(va)
+        if region is None:
+            raise ValueError(f"No bytes in the file at {self.show(va)}")
+        return region
+
+    def section_name(self, va):
+        rva = va - self.base
+        for section in self.sections:
+            if section["rva"] <= rva < section["rva"] + max(section["virtual_size"], section["raw_size"]):
+                return section["name"]
+        return "headers" if 0 <= rva < self.regions[0].size else None
 
     def va_of_offset(self, offset):
         if not 0 <= offset < len(self.data):
-            raise ValueError("Offset is outside the available bytes")
-        for region in self.regions:
-            if region.offset <= offset < region.offset + region.size:
-                return region.va + offset - region.offset
-        raise ValueError("File offset has no mapped VA")
-
-    def region_at(self, va):
-        for region in self.regions:
-            if region.va <= va < region.va + region.size:
-                return region
-        raise ValueError(f"No bytes available at {va:#x}")
-
-    def location(self, offset):
-        if not 0 <= offset < len(self.data):
-            raise ValueError("Offset is outside the available bytes")
-        row = {"offset": hex(offset), "va": None, "rva": None, "region": None}
-        for region in self.regions:
-            if region.offset <= offset < region.offset + region.size:
-                va = region.va + offset - region.offset
-                row.update(va=hex(va), region=region.name)
-                if self.base is not None and self.base <= va < self.base + self.image_size:
-                    row["rva"] = hex(va - self.base)
-                break
-        return row
+            raise ValueError("Offset is outside the file")
+        region = self.region_of_offset(offset)
+        if region is None:
+            raise ValueError("This file offset is not loaded into memory, so it has no address")
+        return region.va + offset - region.offset
 
     def offset_of_va(self, va, count=1):
         if count <= 0 or not 0 <= va < va + count <= ADDRESS_LIMIT:
@@ -97,7 +146,7 @@ class ByteSource:
         available = region.va + region.size - va
         if count > available:
             raise ValueError(
-                f"Read at {va:#x} needs {count} bytes; only {available} available in {region.name}"
+                f"Read at {self.show(va)} needs {count} bytes; only {available} available in {region.name}"
             )
         return region.offset + va - region.va
 
@@ -106,10 +155,8 @@ class ByteSource:
         if mode == "va":
             return value
         if mode == "rva":
-            if self.base is None:
-                raise ValueError("This source has no known image base; use VA or offset")
             if value >= self.image_size:
-                raise ValueError("RVA is outside the source image")
+                raise ValueError("RVA is outside the image")
             return self.base + value
         return self.va_of_offset(value)
 
@@ -117,9 +164,21 @@ class ByteSource:
         mode, value = coordinate(address)
         if mode == "offset":
             if count <= 0 or value + count > len(self.data):
-                raise ValueError("Read exceeds available bytes")
+                raise ValueError("Read exceeds the file")
             return value
         return self.offset_of_va(self.va(address), count)
+
+    def locate(self, address):
+        """(va, offset) of an address; va is None for file bytes that are not loaded, offset for no file bytes."""
+        mode, value = coordinate(address)
+        if mode == "offset":
+            if value >= len(self.data):
+                raise ValueError("Offset is outside the file")
+            region = self.region_of_offset(value)
+            return (region.va + value - region.offset if region else None), value
+        va = self.va(address)
+        region = self.region_of(va)
+        return va, (region.offset + va - region.va if region else None)
 
     def read(self, va, count):
         offset = self.offset_of_va(va, count)
@@ -133,73 +192,51 @@ class ByteSource:
             low = self.offset(start, length)
             high = low + length
         if section or executable:
-            regions = [r for r in self.regions if (not section or r.name == section)]
+            regions = [r for r in self._by_offset if (not section or r.name == section)]
             if not regions:
                 raise ValueError(f"Section not found: {section}")
             if executable:
-                regions = [r for r in regions if r.executable is not False]
+                regions = [r for r in regions if r.executable]
             ranges = [(r.offset, r.offset + r.size) for r in regions]
         else:
             ranges = [(0, len(self.data))]
         return [(max(a, low), min(b, high)) for a, b in ranges if max(a, low) < min(b, high)]
 
+    # Identity
 
-class PE(ByteSource):
-    def __init__(self, path):
-        data = Path(path).read_bytes()
-        self.pe = pefile.PE(data=data, fast_load=True)
-        pe = self.pe
-        if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
-            raise ValueError("Only AMD64 PE32+ images are supported")
-        base = pe.OPTIONAL_HEADER.ImageBase
-        size = pe.OPTIONAL_HEADER.SizeOfImage
-        headers = pe.OPTIONAL_HEADER.SizeOfHeaders
-        if not 0 < headers <= len(data) or not headers <= size or base + size > ADDRESS_LIMIT:
-            raise ValueError("Invalid PE header/image bounds")
-        if len(pe.sections) != pe.FILE_HEADER.NumberOfSections:
-            raise ValueError("Truncated PE section table")
-        regions = [Region("headers", 0, headers, base, executable=False)]
-        for section in pe.sections:
-            offset = section.get_PointerToRawData_adj()
-            rva = section.get_VirtualAddress_adj()
-            raw_size = section.SizeOfRawData
-            if not raw_size:
-                continue
-            if offset + raw_size > len(data) or rva + raw_size > size:
-                raise ValueError("Truncated or out-of-image PE section")
-            regions.append(
-                Region(
-                    section.Name.rstrip(b"\0").decode("ascii", errors="replace"),
-                    offset,
-                    raw_size,
-                    base + rva,
-                    bool(section.Characteristics & 0x20000000),
-                )
+    @cached_property
+    def sha256(self):
+        return hashlib.sha256(self.data).hexdigest()
+
+    def entropy(self, region):
+        """Bits per byte, from evenly spaced samples of a large region."""
+        count, size = ENTROPY_SAMPLE
+        if region.size <= count * size:
+            sample = self.data[region.offset : region.offset + region.size]
+        else:
+            step = (region.size - size) // (count - 1)
+            sample = b"".join(
+                self.data[region.offset + index * step : region.offset + index * step + size]
+                for index in range(count)
             )
-        for key in ("offset", "va"):
-            ordered = sorted(regions, key=lambda r: getattr(r, key))
-            if any(getattr(a, key) + a.size > getattr(b, key) for a, b in zip(ordered, ordered[1:])):
-                raise ValueError("Overlapping PE regions are unsupported")
-        super().__init__(path, data, "pe_file", regions, base=base, image_size=size)
-        self.metadata.update(
-            machine="AMD64",
-            entry_rva=hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
-            pe_timestamp=hex(pe.FILE_HEADER.TimeDateStamp),
+        return -sum(n / len(sample) * math.log2(n / len(sample)) for n in Counter(sample).values())
+
+    @cached_property
+    def packed(self):
+        """A warning when the largest code section does not look like code."""
+        code = [r for r in self.regions if r.executable]
+        if not code:
+            return None
+        largest = max(code, key=lambda r: r.size)
+        entropy = self.entropy(largest)
+        if entropy <= PACKED_ENTROPY:
+            return None
+        return (
+            f"code in {largest.name} looks encrypted or compressed (entropy {entropy:.2f}); "
+            "results that depend on code are unreliable"
         )
 
-    @property
-    def sections(self):
-        return [
-            {
-                "name": s.Name.rstrip(b"\0").decode("ascii", errors="replace"),
-                "rva": hex(s.get_VirtualAddress_adj()),
-                "virtual_size": s.Misc_VirtualSize,
-                "offset": hex(s.get_PointerToRawData_adj()),
-                "raw_size": s.SizeOfRawData,
-                "characteristics": hex(s.Characteristics),
-            }
-            for s in self.pe.sections
-        ]
+    # PE metadata
 
     def directory(self, index):
         directories = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY
@@ -212,19 +249,17 @@ class PE(ByteSource):
 
     @cached_property
     def imports(self):
+        """IAT cell VA -> imported symbol."""
         self.pe.parse_data_directories(directories=[1, 13])
         result = {}
         for attribute, delayed in (("DIRECTORY_ENTRY_IMPORT", False), ("DIRECTORY_ENTRY_DELAY_IMPORT", True)):
             for library in getattr(self.pe, attribute, []):
+                dll = library.dll.decode("ascii", errors="replace")
                 for symbol in library.imports:
-                    result[symbol.address] = {
-                        "dll": library.dll.decode("ascii", errors="replace"),
-                        "name": symbol.name.decode("ascii", errors="replace") if symbol.name else None,
-                        "ordinal": symbol.ordinal,
-                        "iat_va": hex(symbol.address),
-                        "iat_rva": hex(symbol.address - self.base),
-                        "delayed": delayed,
-                    }
+                    name = (
+                        symbol.name.decode("ascii", errors="replace") if symbol.name else f"#{symbol.ordinal}"
+                    )
+                    result[symbol.address] = {"name": f"{dll}!{name}", "delayed": delayed}
         return result
 
     @cached_property
@@ -235,14 +270,24 @@ class PE(ByteSource):
             {
                 "name": symbol.name.decode("ascii", errors="replace") if symbol.name else None,
                 "ordinal": symbol.ordinal,
-                "rva": hex(symbol.address),
+                "rva": symbol.address,
                 "forwarder": symbol.forwarder.decode("ascii", errors="replace") if symbol.forwarder else None,
             }
             for symbol in (directory.symbols if directory else [])
         ]
 
     @cached_property
+    def exported(self):
+        """VA -> the exports at that address, in table order; a forwarded export has no address in this file."""
+        found = {}
+        for symbol in self.exports:
+            if not symbol["forwarder"]:
+                found.setdefault(self.base + symbol["rva"], []).append(symbol)
+        return found
+
+    @cached_property
     def entries(self):
+        """RUNTIME_FUNCTION entries (begin RVA, end RVA, unwind-info RVA), sorted."""
         rva, size = self.directory(3)
         if not size:
             return []
@@ -270,6 +315,7 @@ class PE(ByteSource):
         return self.entries[index] if index >= 0 and rva < self.entries[index][1] else None
 
     def unwind_chain(self, entry):
+        """The entry and the entries it chains to; the last one starts the function."""
         chain, seen = [], set()
         while True:
             if entry in seen or len(chain) >= 64:
@@ -289,49 +335,3 @@ class PE(ByteSource):
                 raise ValueError("Chained unwind info also specifies a handler")
             offset = (4 + header[2] * 2 + 3) & ~3
             entry = struct.unpack("<III", self.read(self.base + unwind + offset, 12))
-
-    def unwind_region(self, va):
-        entry = self.owner(va)
-        if entry is None:
-            raise ValueError("No unwind range contains this address; supply an explicit --bytes range")
-        chain = self.unwind_chain(entry)
-        root = chain[-1]
-        index = bisect.bisect_left(self.starts, entry[0])
-        first = last = index
-        while first and self.entries[first - 1][1] == self.entries[first][0]:
-            if self.unwind_chain(self.entries[first - 1])[-1] != root:
-                break
-            first -= 1
-        while last + 1 < len(self.entries) and self.entries[last][1] == self.entries[last + 1][0]:
-            if self.unwind_chain(self.entries[last + 1])[-1] != root:
-                break
-            last += 1
-        return {
-            "begin_rva": self.entries[first][0],
-            "end_rva": self.entries[last][1],
-            "chain": [{"begin_rva": a, "end_rva": b, "unwind_rva": c} for a, b, c in chain],
-            "contiguous_entries": last - first + 1,
-        }
-
-
-def raw_source(path, start_va, *, module_base=None, module_size=None):
-    if (module_base is None) != (module_size is None):
-        raise ValueError("--module-base and --module-size must be supplied together")
-    if module_base is not None:
-        module_base, module_size = integer(module_base), integer(module_size)
-        if not module_size or module_base + module_size > ADDRESS_LIMIT:
-            raise ValueError("Invalid raw module bounds")
-    start_va = integer(start_va)
-    data = Path(path).read_bytes()
-    if not data or start_va + len(data) > ADDRESS_LIMIT:
-        raise ValueError("Empty or out-of-address-space raw byte range")
-    source = ByteSource(
-        path,
-        data,
-        "raw",
-        [Region("raw", 0, len(data), start_va)],
-        base=module_base,
-        image_size=module_size,
-    )
-    source.metadata["start_va"] = hex(start_va)
-    return source

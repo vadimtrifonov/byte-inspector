@@ -1,160 +1,252 @@
 ---
-name: static-byte-inspector
-description: Disassemble and search AMD64 PE files and raw byte dumps offline. Find strings, signatures, candidate references, and MSVC vtables.
+name: byte-inspector
+description: Disassemble and search AMD64 PE executable and DLL files. Find references, strings, byte signatures, and MSVC class tables; identify the function or class slot at an address.
 ---
 
-# Static Byte Inspector
+# Byte Inspector
 
 Use this skill directory as the working directory.
-Commands read files and print JSON to stdout.
-
-## Setup
+Commands read one PE file and never change it.
 
 ```powershell
 mise trust mise.toml
+mise run inspector -- <command> --file "C:\Path\To\image.exe" ...
 ```
 
-## Sources and addresses
+## Output
 
-Every command requires exactly one source:
+A command prints one `#` summary line for each query, then one result per line.
+Every result line starts with an address that any command accepts as input.
+Fields are separated by two spaces.
+A line break or other control character in a line is written as an escape such as `\n`.
 
-| Source | Meaning |
+```
+# refs rva:0x4af7310  results 17  showing 2  target string "ActivateTypeMode"
+rva:0x2da9  lea rdx, [rip + 0x4af4560]  address taken  function rva:0x2da0
+rva:0x3299  lea rdx, [rip + 0x4af4070]  address taken  function rva:0x3270
+```
+
+`--limit N` applies to each query separately (1..10000, default 100).
+A summary gives the full count, and `showing` when the limit cut the results.
+
+`--jsonl` prints the same facts as JSON records, one per line.
+`record` is `summary`, `result`, `error`, or `note`; other field names are the words of the text line joined by underscores.
+`instruction`, `bytes`, `value`, and `name` are the fields that lines print without a name.
+Each summary record also has the `file` path and its `sha256`.
+
+A summary ends with `warning code in <section> looks encrypted or compressed` when the largest code section has an entropy above 7.0.
+Then disassembly is meaningless and reference searches find little or nothing, without any other sign.
+Use an unpacked copy of the file; executables wrapped by Steam DRM are a common case.
+
+## Addresses
+
+| Address | Meaning |
 |---|---|
-| `--file PATH` | AMD64 PE32+ executable or DLL |
-| `--raw PATH --start-va N` | Raw AMD64 bytes; N is the VA of the first byte |
+| `rva:0x1000` | Relative to the image base |
+| `va:0x140001000` | At the preferred image base stored in the file |
+| `offset:0x400` | Position in the file |
 
-With `--module-base N --module-size N`, raw sources accept `rva:` addresses and report RVAs.
-These define the module's address range, not the available byte range; addresses outside that module have no RVA.
+Output uses `rva:` for every address inside the image and `va:` for addresses outside it.
+An `offset:` whose bytes are loaded is answered as its `rva:`.
+A line starts with `offset:` only when the bytes are in the file but are not loaded into memory, such as a signature after the last section.
+Such bytes can be read with `data`; they have no address, so `disasm` fails and `refs` finds nothing.
 
-Addresses require a prefix:
+## Several queries and piping
 
-| Address | Interpretation |
+`refs`, `disasm`, `data`, and `describe` accept any number of addresses.
+Each address gets the answer it would get alone.
+An answer that an earlier address in the same call already produced is not repeated; its summary says `listed under <that address>`.
+
+A failed address prints `error: <address>: <reason>` in its place, the other addresses are answered, and the exit code is 1.
+When the whole call fails, one `error:` line goes to both stdout and stderr.
+
+The address `-` reads standard input and takes the first field of each line as an address, so one command's lines feed another.
+
+```powershell
+mise run inspector -- refs rva:0x62b200 --kind call --file $exe | mise run inspector -- disasm - --function --file $exe
+```
+
+`#` lines pass through unchanged, so earlier summaries stay visible.
+`error:` lines pass through and make the exit code 1; so does any other line that does not start with an address.
+JSONL is not accepted as input.
+
+## What rows say about an address
+
+Rows describe the addresses they mention with these fields.
+
+| Field | Meaning |
 |---|---|
-| `rva:0x1000` | Relative to the PE preferred image base or the supplied raw `--module-base` |
-| `va:0x140001000` | Preferred-image VA for a PE file; absolute VA for raw bytes |
-| `offset:0x400` | Offset in the input file |
+| `function rva:…` | Start of the function that holds the address; from unwind data unless `estimated from` follows |
+| `function start` | The address is itself that start |
+| `export Name` | The address is exported by that name; `+N` counts its other exported names |
+| `string "…"` | A NUL-terminated ASCII or UTF-16 string starts there |
+| `inside string rva:…` | The address is inside the string that starts at that address |
+| `import DLL!Name` | The address is that import's IAT cell |
+| `class Name  slot N` | The address is slot N of a virtual function table of that class |
+| `no bytes in file` | The address is in the image but the file has no bytes for it, as in uninitialized data |
 
-Numbers accept decimal or `0x` notation.
-PE RVA/VA reads must lie within the headers or one section's raw data; uninitialized section tails have no file bytes.
-Offset-based data reads can access unmapped file bytes, such as overlays; disassembly requires a mapped VA.
+A function without unwind data is named only where a command estimates it: `describe`, `disasm --function`, and the instruction rows of `refs`.
+Other mentions of an address in such code have neither `function` field.
 
-Packed or encrypted on-disk code can produce meaningless `disasm` output and few or no `refs` matches without an error.
-Use bytes captured after unpacking/decryption; a `.bind` section alone does not establish encryption.
-
-## PE metadata
+## describe
 
 ```powershell
-mise run inspector -- info --file "C:\Path\To\image.exe" --limit 50
+mise run inspector -- describe rva:0xa94b90 rva:0x62b217 --file $exe
 ```
 
-Imports identify IAT cells, including delay imports.
-
-## Search
-
-```powershell
-mise run inspector -- find --file "C:\Path\To\image.exe" --text "SettingName" --encoding both
-mise run inspector -- find --file "C:\Path\To\image.exe" --pattern "48 8D ?? ?? ?? ?? ??" --section .text
-mise run inspector -- find --file "C:\Path\To\image.exe" --value 0x1234 --type u32
+```
+# describe rva:0xa94b90  section .text  in file offset:0xa94190  results 4
+rva:0xa94b90  function pieces rva:0xa94b90..rva:0xa94bbc  function size 0x2c
+rva:0x4b80928  class TESKey  slot 16  vtable rva:0x4b808a8  subobject +0x0
+rva:0x4b87ac8  class TESObjectMISC  slot 16  vtable rva:0x4b87a48  subobject +0x0
+rva:0x4b8e338  class TESSoulGem  slot 16  vtable rva:0x4b8e2b8  subobject +0x0
+# describe rva:0x62b217  section .text  in file offset:0x62a817  results 1
+rva:0x62b200  function pieces rva:0x62b200..rva:0x62b228  estimated from 4 direct calls  function size 0x28  query at +0x17
 ```
 
-Text searches are literal and case-sensitive, with `ascii` (default), `utf-16le`, or `both`.
-Signatures use full byte pairs and `??` wildcards, with at least one exact byte.
-Numeric searches use little-endian encoding.
-Search totals count overlapping matches within the selected scope.
+For an address in code, the first row leads with the start of its function.
+The rows after it are about that function: each name it is exported by, and each class-table slot that points to it.
+One function can serve several classes.
+`inside instruction rva:…` appears when the address is not the start of an instruction.
+For data, rows give the import, export, or class slot at the address, and the string that holds it.
+A string row leads with the start of the string, with `query at` when the address is further in.
 
-Searches include the whole file by default, including overlays; unmapped hits have an offset but null RVA/VA.
-Use `--section NAME` or `--start rva:0x1000 --length 0x400` to restrict `find` and `refs`.
+## Functions
 
-## References
+A function is every unwind entry that chains to one start.
+`pieces` lists its byte ranges; compilers place rarely executed pieces far from the start.
+
+Leaf functions have no unwind data.
+Their extent is estimated by decoding forward from the end of the preceding function with unwind data, and labelled `estimated from`:
+
+| Evidence | Wrong starts in tests on known functions |
+|---|---|
+| `N direct calls`, `N pointers` | 0–2% |
+| `the preceding code only` | 0.2–7%, higher in DLLs than in game executables |
+
+An estimated function ends at the first return or jump that no earlier branch passes; later blocks reached only from elsewhere are not included.
+
+## disasm
 
 ```powershell
-mise run inspector -- refs rva:0x123450 --file "C:\Path\To\image.exe" --kind call
-mise run inspector -- refs rva:0x456780 --file "C:\Path\To\image.exe" --kind memory
-mise run inspector -- refs rva:0x123450 --file "C:\Path\To\image.exe" --kind pointer
-mise run inspector -- refs --displacement 0x3F4 --file "C:\Path\To\image.exe"
+mise run inspector -- disasm rva:0x2da9 --function --file $exe --limit 300
+mise run inspector -- disasm rva:0x2da9 rva:0x3299 --bytes 19 --show-bytes --file $exe
+mise run inspector -- disasm rva:0x2feedd --bytes 11 --file $exe
+```
+
+```
+# disasm rva:0x2da9  function rva:0x2da0  pieces rva:0x2da0..rva:0x326f  instructions 256
+rva:0x2da0  push rbx
+...
+# disasm rva:0x2da9  range rva:0x2da9..rva:0x2dbc  function rva:0x2da0  instructions 3
+rva:0x2da9  48 8d 15 60 45 af 04  lea rdx, [rip + 0x4af4560]  target rva:0x4af7310 string "ActivateTypeMode"
+rva:0x2db0  48 8d 0d 09 81 1f 06  lea rcx, [rip + 0x61f8109]  target rva:0x61faec0 no bytes in file
+rva:0x2db7  e8 c4 8c 8c 02  call rva:0x28cba80
+# disasm rva:0x2feedd  range rva:0x2feedb..rva:0x2feee8  function rva:0x2feae0  inside instruction rva:0x2feedb  instructions 2
+rva:0x2feedb  vmulss xmm0, xmm0, dword ptr [rip + 0x4c04f5d]  target rva:0x4f03e40 f32 0.001
+rva:0x2feee3  vmovss dword ptr [rbx + 0x7c], xmm0
+```
+
+Without options, a listing covers up to 256 bytes from the address.
+`--bytes N` sets the byte count (up to 1 MiB); `--function` lists the whole function that holds the address, piece by piece.
+`--show-bytes` adds each instruction's bytes, for signatures and patch sizes.
+
+Where unwind data covers the address, a listing starts at the instruction that holds it.
+An address inside an instruction moves the start back to that instruction, and the summary says `inside instruction rva:…`.
+Elsewhere decoding starts at the given byte.
+Decoding is linear from the start, including bytes after returns.
+When it stops before the end of a range or piece, the summary says where: `ends inside instruction rva:…` for an instruction that needs bytes beyond it, `undecodable at rva:…` for bytes that are not an instruction.
+
+Direct call and jump operands are printed as addresses.
+`target` gives the address a memory operand refers to and what it holds.
+For an instruction that reads one float from a read-only section, `target` also gives that value as `f32` or `f64`.
+A direct call or jump has a `target` only when its destination is exported.
+
+## refs
+
+```powershell
+mise run inspector -- refs rva:0x123450 rva:0x456780 --file $exe --kind call
+mise run inspector -- refs --displacement 0x3F4 --file $exe --section .text
 ```
 
 `--kind` selects `all` (default), `call`, `branch`, `memory`, or `pointer`.
-Calls and branches are direct relative transfers; memory references use RIP/EIP-relative operands.
-Pointer searches match 64-bit addresses throughout the selected scope, including unaligned values.
-Register-dependent transfers, computed addresses, and absolute-address instruction encodings are not resolved by these searches.
+Calls and branches are direct relative transfers; memory references are RIP-relative operands.
+Pointer rows are 64-bit cells that hold the address, anywhere in the file; a cell in a class table names its class and slot, which identifies virtual functions that nothing calls directly.
+Transfers through registers and computed addresses are not found.
 
-For calls or jumps through an IAT cell, search that cell with `--kind memory`.
-Direct calls through an import thunk instead reference the thunk's address.
+For a call or jump through an import, search for the import's IAT cell with `--kind memory`.
 
-Code searches scan executable PE sections, or the supplied raw bytes.
-`--displacement` accepts a nonzero signed 32-bit memory displacement.
-Any base register matches, including `rsp` and `rbp`.
-Displacements in -128..127 require a scan scope of at most 1 MiB.
+Code rows name their function; `estimated from` follows where the function has no unwind data.
+A row whose instruction refers to the address through a memory operand says what it does there: `read`, `write`, both, or `address taken` for `lea`.
+`unverified <reason>` marks a row whose instruction start could not be confirmed by decoding from the start of its unwind entry; without the mark it was confirmed.
 
-| `boundary` | Evidence |
-|---|---|
-| `unwind_linear` | Instruction starts on a boundary decoded from its containing unwind entry |
-| `candidate_no_unwind` | No unwind metadata is available for this candidate |
-| `candidate_after_decode_gap` | Decoding from the unwind entry stopped before the candidate |
-| `candidate_verification_limit` | The unwind entry exceeds the 1 MiB decoding budget |
-| `data_candidate` | Matching pointer bytes, not an instruction |
+`--displacement N` finds instructions with that signed memory displacement on any base register, which locates accesses to a structure field.
+These rows also say `read`, `write`, or `address taken`.
+Displacements from -128 to 127 need `--section` or `--start`/`--length` covering at most 1 MiB.
 
-Candidates inside another instruction in the selected unwind decoding are rejected.
-Code matches are deduplicated by operand-field location and reference kind.
-Without a verified boundary, a prefix heuristic selects one start; it can omit a genuine prefix or include a byte from the preceding instruction.
-
-## Disassembly
+## find
 
 ```powershell
-mise run inspector -- disasm rva:0x123450 --file "C:\Path\To\image.exe" --bytes 256
-mise run inspector -- disasm rva:0x123480 --file "C:\Path\To\image.exe" --unwind --limit 300
-mise run inspector -- disasm offset:0 --raw "$env:TEMP\text.bin" --start-va 0x7FF600001000 --bytes 128
-mise run inspector -- disasm rva:0x1000 --raw "$env:TEMP\code.bin" --start-va 0x7FF600000FE0 `
-  --module-base 0x7FF600000000 --module-size 0x4000000
+mise run inspector -- find --text "Gravity" --text "fJump" --ignore-case --encoding both --file $exe
+mise run inspector -- find --pattern "48 8D ?? ?? ?? ?? ?? E8" --section .text --file $exe
+mise run inspector -- find --value 0x1234 --type u32 --file $exe
 ```
 
-A raw range can begin mid-instruction; request a known instruction address.
+```
+# find TypeMode  results 1  scanned bytes 102476200
+rva:0x4af7310  string "ActivateTypeMode"  match +8
+```
 
-Decoding is linear, including bytes after branches and returns.
-References are annotated with available strings and import names.
+Each `--text`, `--pattern`, or `--value` is a query.
+A text row leads with the start of the text around the match, which is the address code refers to; `match` is the character position of the match in it.
+That text is the printable ASCII characters, tabs, and line breaks on both sides of the match.
+Long text is shown as a part around the match, with `...` where it is cut.
+Decorated C++ type names such as `.?AVActor@@` are found this way.
 
-By default, decoding uses up to 256 bytes from the requested address, ending at the current PE header/section or raw byte range.
-`--bytes N` requests exactly N bytes (1..1,048,576); unavailable bytes are an error.
-`--unwind` selects the containing PE unwind entry and adjacent entries with the same chained root.
-The combined range must fit in 1 MiB.
-Unwind entries can represent parts of a function; nonadjacent parents are listed in the chain but are not joined into the disassembly.
+Text is `ascii` (default), `utf-16le`, or `both`.
+`--ignore-case` ignores the case of the letters A to Z; other characters match exactly.
+Patterns are byte pairs with `??` wildcards; numbers are little-endian in the given `--type`.
+Searches cover the whole file; `--section NAME` or `--start ADDRESS --length N` narrows them.
+Counts include overlapping matches.
 
-`stop_reason` is `range_end`, `output_limit`, or `invalid_or_truncated_instruction`.
-
-## Data and pointer tables
+## data
 
 ```powershell
-mise run inspector -- data rva:0x456780 --file "C:\Path\To\image.exe" --type pointer --count 16
-mise run inspector -- data offset:0 --raw "$env:TEMP\values.bin" --start-va 0 --type f32 --count 8
+mise run inspector -- data rva:0x4b87a48 --type pointer --count 8 --file $exe
+mise run inspector -- data rva:0x3b4a144 --type f32 --count 4 --file $exe
 ```
 
-Types: `u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/pointer`.
-All are little-endian; pointers are eight bytes.
-Defaults are `u8` and 16 elements, with a maximum of 4096.
-Nonfinite floats are strings such as `nan` or `inf` to keep the output valid JSON.
+Types are `u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 pointer`, little-endian; `--count` defaults to 16 (maximum 4096).
+`u8` prints 16 bytes per row with their ASCII text; other types print one value per row.
+A `pointer` row says what the address it points to holds.
 
-## MSVC x64 RTTI
+## rtti
 
 ```powershell
-mise run inspector -- rtti '.?AVActor@@' --file "C:\Path\To\image.exe" --slots 16
-mise run inspector -- rtti '.?AVActor@@' --file "C:\Path\To\image.exe" --slot-start 213 --slots 1
+mise run inspector -- rtti Actor BSScript::Object --slots 2 --limit 1 --file $exe
+mise run inspector -- rtti Actor --slot-start 275 --slots 1 --limit 1 --file $exe
 ```
 
-Requires a PE file and an exact decorated class or struct name.
-Supports image-relative complete-object locators with signature 1.
-The primary vtable's `subobject_offset` is `0x0`.
+```
+# rtti Actor  table 1 of 25  type .?AVActor@@  vtable rva:0x4cb9248  subobject +0x0  slots 2
+rva:0x18d7c40  slot 0  cell rva:0x4cb9248
+rva:0x3ae910  slot 1  cell rva:0x4cb9250
+```
 
-`--slot-start` is zero-based (0..65535); `--slots` defaults to 16 and accepts 1..1024.
-Reading stops at the requested count, unavailable bytes, or a destination outside executable PE sections.
-These stops describe the read, not the vtable's length.
+A name is a plain class or struct name, with `::` for namespaces, or an exact decorated name such as `.?AVActor@@`, which templates require.
+Each virtual function table is a summary; the primary table, `subobject +0x0`, comes first, and `--limit` counts tables.
+Slot rows lead with the function, with the slot's own address in `cell`.
 
-## Output limits and errors
+`--slots` defaults to 16 (1..1024) and `--slot-start` to 0.
+A table ends at its first cell that does not point into code.
+`table ends before slot N` says the table has only N slots when the request reaches past them.
+Only MSVC x64 RTTI is supported.
 
-Commands with `--limit` accept 1..10000, defaulting to 100.
-`find`, `refs`, and `rtti` report total matches even when the displayed results are truncated.
-For `info`, the limit applies separately to imports and exports; sections are listed in full.
-Disassembly stops at its instruction limit instead of counting the remaining instructions.
+## info
 
-Input and range errors return nonzero with a diagnostic on stderr and no JSON output.
-Incomplete decoding is reported by `stop_reason` and returns zero.
+```powershell
+mise run inspector -- info --file $exe --limit 50
+```
+
+Prints the file's SHA-256, image base, and entry point, then sections with their entropy, imports with their IAT cells, and exports.
+`--limit` applies to imports and exports separately.

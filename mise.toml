@@ -12,12 +12,13 @@ _.python.venv = { path = ".venv", create = true, uv_create_args = ["--seed"] }
 auto = true
 
 [tasks.inspector]
-description = "Run Static Byte Inspector"
+description = "Run Byte Inspector"
 run = "python -B -m scripts"
+quiet = true
 
 [tasks.test]
-description = "Run offline regression tests"
-run = "python -B -m unittest discover -s tests -v"
+description = "Run the unit tests"
+run = "python -B -m unittest discover -s tests"
 
 [tasks.check]
 description = "Check Python formatting and lint rules"
