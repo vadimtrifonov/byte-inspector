@@ -82,6 +82,7 @@ Rows describe the addresses they mention with these fields.
 | `string "…"` | A NUL-terminated ASCII or UTF-16 string starts there |
 | `inside string rva:…` | The address is inside the string that starts at that address |
 | `import DLL!Name` | The address is that import's IAT cell |
+| `import stub DLL!Name` | The code at the address jumps through that import's IAT cell, so a call to the address reaches the import |
 | `class Name  slot N` | The address is slot N of a virtual function table of that class |
 | `no bytes in file` | The address is in the image but the file has no bytes for it, as in uninitialized data |
 
@@ -105,7 +106,7 @@ rva:0x62b200  function pieces rva:0x62b200..rva:0x62b228  estimated from 4 direc
 ```
 
 For an address in code, the first row leads with the start of its function.
-The rows after it are about that function: each name it is exported by, and each class-table slot that points to it.
+The rows after it are about that function: each name it is exported by, the import it is a stub for, and each class-table slot that points to it.
 One function can serve several classes.
 `inside instruction rva:…` appears when the address is not the start of an instruction.
 For data, rows give the import, export, or class slot at the address, and the string that holds it.
@@ -160,7 +161,7 @@ When it stops before the end of a range or piece, the summary says where: `ends 
 Direct call and jump operands are printed as addresses.
 `target` gives the address a memory operand refers to and what it holds.
 For an instruction that reads one float from a read-only section, `target` also gives that value as `f32` or `f64`.
-A direct call or jump has a `target` only when its destination is exported.
+A direct call or jump has a `target` only when its destination is exported or is an import stub.
 
 ## refs
 
@@ -175,6 +176,7 @@ Pointer rows are 64-bit cells that hold the address, anywhere in the file; a cel
 Transfers through registers and computed addresses are not found.
 
 For a call or jump through an import, search for the import's IAT cell with `--kind memory`.
+That search also finds the import's stub, if it has one; the callers of the stub are direct calls to the stub's address.
 
 Code rows name their function; `estimated from` follows where the function has no unwind data.
 A row whose instruction refers to the address through a memory operand says what it does there: `read`, `write`, both, or `address taken` for `lea`.

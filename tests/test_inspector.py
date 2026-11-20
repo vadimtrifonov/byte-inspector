@@ -409,6 +409,27 @@ class InspectorTests(unittest.TestCase):
         _, rows = one(Inspector(PE(path)).disasm("rva:0x1100", byte_count=8))
         self.assertEqual(rows[0]["target"], {"address": "rva:0x2700"})
 
+    def test_a_stub_that_jumps_to_an_import_carries_its_name(self):
+        name = "KERNEL32.dll!LoadLibraryW"
+        patched = self.patched(
+            {
+                0x1300: rip(0x1300, b"\xff\x25", 0x2190),
+                0x1310: rip(0x1310, b"\x48\xff\x25", 0x2190),  # the same jump with a REX.W prefix
+                0x1320: rip(0x1320, b"\xe8", 0x1300) + rip(0x1325, b"\xe9", 0x1310),
+                0x1330: rip(0x1330, b"\xff\x25", 0x2040),  # a jump through a cell that is not an import
+            },
+            "stubs.dll",
+        )
+        _, rows = one(patched.disasm("rva:0x1320", byte_count=10))
+        self.assertEqual(
+            [row["target"] for row in rows],
+            [{"address": "rva:0x1300", "import_stub": name}, {"address": "rva:0x1310", "import_stub": name}],
+        )
+        self.assertEqual(one(patched.refs("rva:0x1300", kind="call"))[0]["target"], {"import_stub": name})
+        self.assertIn({"address": "rva:0x1300", "import_stub": name}, one(patched.describe("rva:0x1300"))[1])
+        self.assertEqual(patched.import_stub(BASE + 0x1330), {})
+        self.assertEqual(patched.import_stub(BASE + 0x2190), {})  # the import cell is not code
+
     def test_typed_reads_floats_and_pointer_tables(self):
         values = struct.pack("<fffi", float("nan"), 70.0, 0.1, -2) + bytes.fromhex("ffff7f7f")
         data = self.patched({0x2700: values}).data

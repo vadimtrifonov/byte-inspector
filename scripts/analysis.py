@@ -26,6 +26,7 @@ FORMATS = {
     "f64": "d",
     "pointer": "Q",
 }
+STUB_JUMPS = (b"\xff\x25", b"\x48\xff\x25")  # jmp qword ptr [rip + disp32], without and with REX.W
 STRING_SHOWN = 120  # characters of a string shown beside an address
 MATCH_SHOWN = 256  # characters of a string shown around a text match
 TEXT = rb"[\t\n\r\x20-\x7e]"
@@ -153,6 +154,23 @@ class Inspector:
         name = symbols[0]["name"] or f"#{symbols[0]['ordinal']}"
         return {"export": name + (f" +{len(symbols) - 1}" if len(symbols) > 1 else "")}
 
+    def import_stub(self, va):
+        """The import that code at an address jumps straight to: `jmp [import cell]`, as calls to a stub reach it."""
+        source = self.source
+        region = source.region_of(va)
+        if region is None or not region.executable:
+            return {}
+        for opcode in STUB_JUMPS:
+            size = len(opcode) + 4
+            try:
+                raw = source.read(va, size)
+            except ValueError:
+                continue
+            if raw.startswith(opcode):
+                symbol = source.imports.get(va + size + struct.unpack_from("<i", raw, len(opcode))[0])
+                return {"import_stub": symbol["name"]} if symbol else {}
+        return {}
+
     def constant(self, ins, va):
         """The float an instruction reads from read-only data, as {type: value}."""
         kind = float_type(ins)
@@ -171,7 +189,7 @@ class Inspector:
         return {"class": readable(found[0].name), "slot": found[1]} if found else {}
 
     def facts(self, va):
-        """What is known cheaply about an address: an import, an export, a function, a class slot, or a string."""
+        """What is known cheaply about an address: an import or a stub for one, an export, a function, a class slot, or a string."""
         source = self.source
         if not source.base <= va < source.base + source.image_size:
             return {}
@@ -185,7 +203,7 @@ class Inspector:
         if region is None:
             return {"no_bytes_in_file": True}
         if region.executable:
-            return self.code_facts(va)
+            return {**self.code_facts(va), **self.import_stub(va)}
         found = self.slot_facts(va)
         if found:
             return found
@@ -214,8 +232,10 @@ class Inspector:
             for kind, va in refs:
                 if kind == "memory":
                     row["target"] = {**self.held(va), **self.constant(ins, va)}
-                elif va in source.exported:  # the operand already gives the address of a call or jump
-                    row["target"] = {"address": source.show(va), **self.export_name(va)}
+                else:  # the operand already gives the address of a call or jump
+                    named = {**self.export_name(va), **self.import_stub(va)}
+                    if named:
+                        row["target"] = {"address": source.show(va), **named}
         return row
 
     # Commands
@@ -570,13 +590,16 @@ class Inspector:
         else:
             summary["in_file"] = f"offset:{offset:#x}"
 
-        def exports(address):
+        def names(address):
             for symbol in source.exported.get(address, ()):
                 yield {
                     "address": source.show(address),
                     "export": symbol["name"],
                     "ordinal": symbol["ordinal"],
                 }
+            stub = self.import_stub(address)
+            if stub:
+                yield {"address": source.show(address), **stub}
 
         def rows():
             if va in source.imports:
@@ -587,7 +610,7 @@ class Inspector:
                     found = self.functions.function(va)
                 except ValueError as exc:
                     summary["note"] = str(exc)
-                    yield from exports(va)
+                    yield from names(va)
                     return
                 row = {"address": source.show(found.start), **self._function_fields(found, "function_pieces")}
                 row["function_size"] = hex(sum(end - begin for begin, end in found.pieces))
@@ -598,13 +621,14 @@ class Inspector:
                 if inside is not None and inside != va:
                     row["inside_instruction"] = source.show(inside)
                 yield row
-                # What follows is about the function: the names it is exported by, and the class slots it fills.
+                # What follows is about the function: its exported names, the import it is a stub for,
+                # and the class slots it fills.
                 for address in dict.fromkeys((found.start, va)):
-                    yield from exports(address)
+                    yield from names(address)
                 for cell, table, index in self.classes.owners(found.start):
                     yield self._slot_row(cell, table, index)
                 return
-            yield from exports(va)
+            yield from names(va)
             if region is None:
                 return
             found = self.classes.slot_at(va)
