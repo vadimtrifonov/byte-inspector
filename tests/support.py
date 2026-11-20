@@ -100,3 +100,40 @@ def fixture(path, patches=None):
     data.extend(b"OverlayAnchor\0")
     Path(path).write_bytes(data)
     return Path(path)
+
+
+def saved_copy(path, target, *, base=BASE, patches=None, relocated=(), unreadable=(), modules=()):
+    """The fixture as `snapshot` saves it from a process, where a mod wrote `patches` over the loaded image.
+
+    `relocated` lists RVAs on the .rdata page that the image's relocation data says hold addresses.
+    The headers stay those of the file: its layout, and the base it prefers whatever `base` it got.
+    """
+    from scripts.sources import copy_end
+
+    raw = Path(path).read_bytes()
+    image = bytearray(0x4000)
+    image[:0x400] = raw[:0x400]
+    for rva, offset, size in ((0x1000, 0x400, 0x400), (0x2000, 0x800, 0x800), (0x3000, 0x1000, 0x200)):
+        image[rva : rva + size] = raw[offset : offset + size]
+    if relocated:
+        entries = [0xA000 | (rva - 0x2000) for rva in relocated]
+        entries += [0] * (len(entries) % 2)
+        block = struct.pack(f"<II{len(entries)}H", 0x2000, 8 + 2 * len(entries), *entries)
+        image[0x2F00 : 0x2F00 + len(block)] = block
+        struct.pack_into("<II", image, 0x98 + 112 + 5 * 8, 0x2F00, len(block))
+    for rva, patch in (patches or {}).items():
+        image[rva : rva + len(patch)] = patch
+    record = {
+        "process": {
+            "name": "game.exe",
+            "path": r"C:\game\game.exe",
+            "pid": 4242,
+            "started": "2026-01-01T00:00:00",
+        },
+        "module": {"name": "fixture.dll", "path": str(path), "base": base},
+        "read": "2026-01-01T00:01:00",
+        "modules": [{"name": name, "path": name, "base": base, "size": size} for name, base, size in modules],
+        "unreadable": [list(hole) for hole in unreadable],
+    }
+    Path(target).write_bytes(bytes(image) + copy_end(record))
+    return Path(target)

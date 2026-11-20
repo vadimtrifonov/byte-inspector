@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import fixture
+from support import fixture, saved_copy
 
 from scripts.__main__ import main
 from scripts.output import line
@@ -239,6 +239,31 @@ class CommandLineTests(unittest.TestCase):
                     )
                 self.assertTrue(all("warning" in json.loads(text) for text in records if '"summary"' in text))
                 self.assertFalse([text for text in clean if "warning" in text])
+
+    def test_a_search_says_what_could_not_be_read_from_the_process(self):
+        copy = saved_copy(self.path, self.root / "loaded.bin", unreadable=[(0x1000, 0x2000, "no access")])
+        missing = "  warning 0x1000 bytes could not be read from the process (info lists the ranges); "
+        # A search would only come back with less; a read of those bytes fails where it is asked for.
+        for command in (["find", "--pattern", "E8"], ["refs", "rva:0x2040"], ["rtti", "Widget"]):
+            code, lines, _ = self.run_cli(*command, path=copy)
+            with self.subTest(command=command):
+                self.assertEqual(code, 0)
+                self.assertTrue(all(missing in text for text in lines if text.startswith("#")))
+        code, lines, _ = self.run_cli("data", "rva:0x1000", "rva:0x2040", "--count", "1", path=copy)
+        self.assertEqual(
+            (code, lines),
+            (
+                1,
+                [
+                    "error: rva:0x1000: Cannot read rva:0x1000 from the process: no access",
+                    "# data rva:0x2040  type u8  count 1",
+                    'rva:0x2040  41  ascii "A"',
+                ],
+            ),
+        )
+        _, records, _ = self.run_cli("find", "--text", "Anchor", "--jsonl", path=copy)
+        summary = json.loads(records[0])
+        self.assertEqual((summary["file"], summary["results"]), (str(copy), 1))
 
     def test_the_tool_runs_as_a_module_and_does_not_change_the_file(self):
         before = self.path.read_bytes()

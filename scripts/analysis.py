@@ -86,8 +86,10 @@ def shortest(value, fmt):
 
 
 class Inspector:
-    def __init__(self, source):
+    def __init__(self, source, elsewhere=None, pointer=None):
         self.source = source
+        self.elsewhere = elsewhere or source.where  # what an address outside the source is, as fields
+        self.pointer = pointer  # the address a cell outside the source holds; only a running process has it
         self.functions = Functions(source)
         self.classes = Classes(source)
 
@@ -184,6 +186,49 @@ class Inspector:
             return {}
         return {kind: shortest(struct.unpack(fmt, raw)[0], fmt)}
 
+    def import_cell(self, va):
+        """An import cell: the import the image declares and, in a process, where the cell led when read.
+
+        The declared import and the place are separate facts. They name different modules when the
+        import is forwarded, and when something replaced what the loader wrote.
+        """
+        source = self.source
+        symbol = source.imports[va]
+        fields = {"import": symbol["name"]}
+        if symbol.get("unnamed"):
+            fields["name_unavailable"] = True
+        if source.from_process:
+            try:
+                value = struct.unpack("<Q", source.read(va, 8))[0]
+            except ValueError:
+                return fields
+            known = self._named(value) if source.holds(value) else self.elsewhere(value)
+            fields["points_to"] = {"address": source.show(value), **known}
+        return fields
+
+    def destination(self, ins, va):
+        """Where a call or jump through a cell leads in a process: what the cell held when it was read.
+
+        A file has only the cell's initial value. An import cell says where it leads with its import.
+        """
+        source = self.source
+        transfer = ins.group(cs.CS_GRP_CALL) or ins.group(cs.CS_GRP_JUMP)
+        if not source.from_process or not transfer or va in source.imports:
+            return {}
+        if source.holds(va):
+            try:
+                value = struct.unpack("<Q", source.read(va, 8))[0]
+            except ValueError:
+                return {}  # the cell's own facts say why: unreadable, or no bytes
+        elif self.pointer is None:
+            return {"not_saved": True}  # a saved copy holds one module; the cell was elsewhere in the process
+        else:
+            try:
+                value = self.pointer(va)
+            except ValueError:
+                return {"unreadable": True}
+        return {"points_to": self.held(value)}
+
     def slot_facts(self, va):
         found = self.classes.slot_at(va)
         return {"class": readable(found[0].name), "slot": found[1]} if found else {}
@@ -191,17 +236,20 @@ class Inspector:
     def facts(self, va):
         """What is known cheaply about an address: an import or a stub for one, an export, a function, a class slot, or a string."""
         source = self.source
-        if not source.base <= va < source.base + source.image_size:
-            return {}
+        if not source.holds(va):
+            return self.elsewhere(va)
         if va in source.imports:
-            return {"import": source.imports[va]["name"]}
+            return self.import_cell(va)
+        return self._named(va)
+
+    def _named(self, va):
         return {**self.export_name(va), **self._holds(va)}
 
     def _holds(self, va):
         source = self.source
         region = source.region_of(va)
         if region is None:
-            return {"no_bytes_in_file": True}
+            return source.missing(va)
         if region.executable:
             return {**self.code_facts(va), **self.import_stub(va)}
         found = self.slot_facts(va)
@@ -213,7 +261,13 @@ class Inspector:
         return {"string": found[1]} if found[0] == va else {"inside_string": source.show(found[0])}
 
     def held(self, va):
-        return {"address": self.source.show(va), **self.facts(va)}
+        source = self.source
+        known = self.facts(va)
+        if not source.image and source.holds(
+            va
+        ):  # memory outside a module has no names: say what memory, as elsewhere
+            known = {"in": source.name, **known}
+        return {"address": source.show(va), **known}
 
     # Instructions
 
@@ -231,9 +285,10 @@ class Inspector:
         if targets:
             for kind, va in refs:
                 if kind == "memory":
-                    row["target"] = {**self.held(va), **self.constant(ins, va)}
+                    row["target"] = {**self.held(va), **self.constant(ins, va), **self.destination(ins, va)}
                 else:  # the operand already gives the address of a call or jump
-                    named = {**self.export_name(va), **self.import_stub(va)}
+                    inside = source.holds(va)
+                    named = {**self.export_name(va), **self.import_stub(va)} if inside else self.elsewhere(va)
                     if named:
                         row["target"] = {"address": source.show(va), **named}
         return row
@@ -251,31 +306,39 @@ class Inspector:
                 "name": section["name"],
                 "size": hex(section["virtual_size"]),
             }
-            if section["raw_size"]:
-                region = source.region_of(source.base + section["rva"])
-                row.update(
-                    in_file=f"offset:{section['offset']:#x}",
-                    size_in_file=hex(section["raw_size"]),
-                    entropy=f"{source.entropy(region):.2f}",
-                )
+            region = source.region_of(source.base + section["rva"])
+            if (
+                section["raw_size"] and not source.record
+            ):  # a loaded module has no layout of its own in a file
+                row.update(in_file=f"offset:{section['offset']:#x}", size_in_file=hex(section["raw_size"]))
+            if region is not None:
+                row["entropy"] = f"{source.entropy(region):.2f}"
             row.update(code=bool(flags & 0x20000000), writable=bool(flags & 0x80000000))
             sections.append(row)
-        identity = {
-            "file": str(source.path),
-            "sha256": source.sha256,
+        record = source.record
+        identity = dict(source.identity)
+        if record:
+            process = record["process"]
+            identity.update(
+                process=process["name"], pid=process["pid"], module=source.name, read=record["read"]
+            )
+            identity.update(process_started=process["started"], module_path=record["module"]["path"])
+        identity |= {
             "image_base": f"va:{source.base:#x}",
             "image_size": hex(source.image_size),
             "entry": source.show(source.base + pe.OPTIONAL_HEADER.AddressOfEntryPoint),
             "timestamp": hex(pe.FILE_HEADER.TimeDateStamp),
             "unwind_entries": len(source.entries),
         }
-        imports, total_imports = limited(
-            (
-                {"address": source.show(va), "import": symbol["name"], "delayed": symbol["delayed"]}
-                for va, symbol in source.imports.items()
-            ),
-            limit,
-        )
+
+        def import_row(va, symbol):
+            cell = self.import_cell(va)
+            leads = cell.pop("points_to", None)
+            return {"address": source.show(va), **cell, "delayed": symbol["delayed"], "points_to": leads}
+
+        shown, total_imports = limited(source.imports.items(), limit)
+        imports = [import_row(va, symbol) for va, symbol in shown]
+        unnamed = sum(1 for symbol in source.imports.values() if symbol.get("unnamed"))
         exports, total_exports = limited(
             (
                 {
@@ -291,11 +354,36 @@ class Inspector:
         warnings = pe.get_warnings()
         if warnings:
             identity["pe_warnings"] = "; ".join(warnings)
-        return {
+        parts = {
             "sections": ({**identity, "results": len(sections)}, sections),
-            "imports": (counted(total_imports, imports), imports),
+            "imports": ({**counted(total_imports, imports), "names_unavailable": unnamed or None}, imports),
             "exports": (counted(total_exports, exports), exports),
         }
+        if record:  # what the process had loaded, and what could not be read from it
+            modules, total_modules = limited(
+                (
+                    {
+                        "address": f"va:{module['base']:#x}",
+                        "name": module["name"],
+                        "size": hex(module["size"]),
+                        "path": module["path"],
+                    }
+                    for module in record["modules"]
+                ),
+                limit,
+            )
+            parts["modules"] = (counted(total_modules, modules), modules)
+            if source.holes:
+                holes = [
+                    {
+                        "address": source.show(source.base + begin),
+                        "size": hex(end - begin),
+                        "unreadable": reason,
+                    }
+                    for begin, end, reason in source.holes
+                ]
+                parts["unreadable"] = ({"results": len(holes)}, holes[:limit])
+        return parts
 
     def find(
         self,
@@ -452,10 +540,13 @@ class Inspector:
             row.update(self.code_facts(cell) if region.executable else self.slot_facts(cell))
         return row
 
-    def disasm(self, address, *, byte_count=None, function=False, limit=100, show_bytes=False):
+    def disasm(self, address, *, byte_count=None, before=0, function=False, limit=100, show_bytes=False):
         source = self.source
         va = source.va(address)
         summary = {}
+        open_ended = False
+        if function and before:
+            raise ValueError("--before does not apply to a whole function")
         if function:
             found = self.functions.function(va)
             ranges = found.pieces
@@ -463,41 +554,69 @@ class Inspector:
             summary.update(function=source.show(found.start), **self.export_name(found.start))
             summary.update(self._function_fields(found))
         else:
-            if byte_count is None:
-                region = source.region_at(va)
+            region = source.region_at(va)
+            open_ended = byte_count is None
+            if open_ended:
                 byte_count = min(256, region.va + region.size - va)
-            size = byte_count
+            first = max(region.va, va - before)
+            size = va + byte_count - first
             # Decoding from inside an instruction gives instructions that are not there.
-            begin = self.functions.instruction_at(va)
-            begin = va if begin is None else begin
+            begin = self.functions.instruction_at(first)
+            begin = first if begin is None else begin
             ranges = [(begin, va + byte_count)]
             summary["range"] = self._range(*ranges[0])
             summary.update(self.code_facts(va))
-            if begin != va:
-                summary["inside_instruction"] = source.show(begin)
+            inside = self.functions.instruction_at(va)
+            if inside is not None and inside != va:
+                summary["inside_instruction"] = source.show(inside)
         if not 0 < size <= MAX_DECODE_BYTES:
             raise ValueError(f"Disassembly ranges must be 1..{MAX_DECODE_BYTES} bytes")
         rows, total, stops = [], 0, {}
+
+        def stop(reason, at):
+            if source.show(at) not in stops.setdefault(reason, []):
+                stops[reason].append(source.show(at))
+
         for begin, end in ranges:
+            # Bytes that the process did not let anyone read end a listing; what precedes them is listed.
+            # A range without a given size would have gone on, so it also says when they are what ended it.
+            unread = source.unread_from(begin, end + open_ended)
+            if unread is not None:
+                stop("unreadable_at", unread)
+                if unread == begin:
+                    continue
+                end = unread
             raw = source.read(begin, end - begin)
             decoded = begin
+            reached = function or begin == va or "inside_instruction" in summary
             for at, size, _, _ in self.functions.lite.disasm_lite(raw, begin):
                 total += 1
                 decoded = at + size
+                reached = reached or at == va
+            if not reached and decoded > va:
+                summary["note"] = (
+                    f"decoding from {source.show(begin)} does not arrive at {source.show(va)} as the start of an "
+                    "instruction, so the instructions shown before it may not be the real ones"
+                )
             if decoded < end:
-                reason = "ends_inside_instruction" if self._runs_past(decoded, end) else "undecodable_at"
-                stops.setdefault(reason, []).append(source.show(decoded))
+                stop(*self._stopped(decoded, end))
             if len(rows) < limit:
                 for ins in self.decoder.disasm(raw, begin, count=limit - len(rows)):
                     rows.append(self.instruction(ins, show_bytes=show_bytes))
         summary.update(counted(total, rows, "instructions"), **stops)
         return [(summary, rows)]
 
-    def _runs_past(self, va, end):
-        """Whether an instruction starts at `va` and needs bytes beyond `end`."""
-        region = self.source.region_at(va)
-        raw = self.source.read(va, min(15, region.va + region.size - va))
-        return any(va + size > end for _, size, _, _ in self.functions.lite.disasm_lite(raw, va, 1))
+    def _stopped(self, va, end):
+        """Why decoding a range stopped at `va` before its `end`, and the address that reason is about."""
+        source = self.source
+        region = source.region_at(va)
+        raw = source.read(va, min(15, region.va + region.size - va))
+        if any(va + size > end for _, size, _, _ in self.functions.lite.disasm_lite(raw, va, 1)):
+            return "ends_inside_instruction", va
+        unread = source.unread_from(va + len(raw), va + 15)
+        if unread == va + len(raw):  # an instruction here would run into bytes nobody could read
+            return "unreadable_at", unread
+        return "undecodable_at", va
 
     def _range(self, begin, end):
         return f"{self.source.show(begin)}..{self.source.show(end)}"
@@ -557,7 +676,10 @@ class Inspector:
             for index in range(slot_start, count):
                 cell = table.vtable + index * 8
                 target = self.classes.code_pointer(cell)
-                rows.append({"address": source.show(target), "slot": index, "cell": source.show(cell)})
+                outside = {} if source.holds(target) else self.elsewhere(target)  # where a mod redirected it
+                rows.append(
+                    {"address": source.show(target), **outside, "slot": index, "cell": source.show(cell)}
+                )
             summary = {
                 "table": f"{number} of {len(tables)}",
                 "type": table.name,
@@ -582,13 +704,9 @@ class Inspector:
                     [],
                 )
             ]
-        if not source.base <= va < source.base + source.image_size:
-            return [({"outside_the_image": True}, [])]
-        summary = {"section": source.section_name(va)}
-        if offset is None:
-            summary["no_bytes_in_file"] = True
-        else:
-            summary["in_file"] = f"offset:{offset:#x}"
+        if not source.holds(va):
+            return [({"outside_the_image": True, **self.elsewhere(va)}, [])]
+        summary = source.place(va, offset)
 
         def names(address):
             for symbol in source.exported.get(address, ()):
@@ -603,7 +721,7 @@ class Inspector:
 
         def rows():
             if va in source.imports:
-                yield {"address": source.show(va), "import": source.imports[va]["name"]}
+                yield {"address": source.show(va), **self.import_cell(va)}
             region = source.region_of(va)
             if region is not None and region.executable:
                 try:

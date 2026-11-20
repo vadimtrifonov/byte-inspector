@@ -1,47 +1,44 @@
 # Byte Inspector
 
-Byte Inspector is a command-line tool for reading x86-64 code and data in Windows PE executables and DLLs.
-It disassembles functions, finds references, strings, and byte patterns, and says what an address holds.
+Byte Inspector is an agent skill for reading the machine code and data of x64 Windows executables and DLLs, on disk or loaded in a running process.
+It finds strings, byte patterns, and what refers to an address, lists instructions, and says what an address belongs to: a function, a class and its slot, a string, or an import.
 
-## Output
+```
+# refs rva:0x4af7310  results 17  showing 2  target string "ActivateTypeMode"
+rva:0x2da9  lea rdx, [rip + 0x4af4560]  address taken  function rva:0x2da0
+rva:0x3299  lea rdx, [rip + 0x4af4070]  address taken  function rva:0x3270
+```
 
-Results are text lines: a summary for each query, then one result per line, each starting with an address.
-Printed addresses are valid input, so a command accepts several addresses at once and can read another command's lines from standard input.
-`--jsonl` prints the same facts as JSON records.
+Every result line starts with an address that any command accepts, so the lines of one command feed the next.
+Addresses are relative to the image, so they are the same in the file and wherever it is loaded.
 
-Addresses inside the image are relative to its base (`rva:`), so they stay the same wherever the image is loaded.
+## Running processes
 
-## Commands
+The same commands read a module of a running process.
+It shows what the file cannot: decrypted code, current values, and what other code changed.
+Where a mod redirected a call, a class slot, or an import, the line says where it now leads.
+Here a call in a game goes through a cell in memory that a mod allocated, to the mod's DLL:
 
-| Command | Input | Output |
-|---|---|---|
-| `info` | – | File identity, sections with entropy, imports, exports |
-| `find` | Text, byte patterns, or numbers | Matches; for text, the string around each match |
-| `refs` | Addresses, or a memory displacement | Instructions and stored pointers that refer to each address |
-| `disasm` | Addresses | Instructions in a byte range or in the whole function |
-| `data` | Addresses and a type | Values, or a pointer table with what each pointer refers to |
-| `rtti` | Class names | Virtual function tables and their slots |
-| `describe` | Addresses | The function, class slots, string, import, or export at each address |
+```
+rva:0x1843ef  call qword ptr [rip - 0x1a3aa3]  target va:0x7ff7c1920952 in private memory points to va:0x7ffe1e6ea5e0 in skyrimvresl.dll rva:0x2a5e0
+```
 
-## Functions
+A loaded module can be saved to a file, which the commands read after the process has ended.
 
-Windows unwind data records where functions are; it can split one function into pieces that lie far apart.
-Byte Inspector treats all pieces that belong to one start as one function.
-Functions that the unwind data omits get an estimated extent, labelled with the evidence for it.
+## Install
 
-## Encrypted code
+The skill runs on Windows and needs [mise](https://mise.jdx.dev/), which installs the Python version and the packages that the skill pins.
+Install it with [skills](https://github.com/vercel-labs/skills):
 
-Some executables keep their code encrypted or compressed on disk.
-Their strings and data still read normally, while disassembly is meaningless and reference searches come back empty.
-Byte Inspector measures the entropy of the largest code section and adds a warning to every summary when it is above 7.0 bits per byte.
-The measure is a heuristic: a missing warning does not prove the code is plain.
+```powershell
+npx skills add vadimtrifonov/byte-inspector
+```
 
-## Getting started
+## Limits
 
-Setup and development tasks use [mise](https://mise.jdx.dev/).
-See [SKILL.md](SKILL.md) for setup and operating commands.
+Byte Inspector is a disassembler: it shows the instructions of a function, not C.
+To read a function as C, use [Ghidra Decompiler](https://github.com/vadimtrifonov/ghidra-decompiler).
 
-## Development
-
-Run the unit tests with `mise run test`.
-Check the tool's Python formatting and lint rules with `mise run check`.
+It finds references that are written into code and data: a call to an address, an instruction that reads it, a pointer that holds it.
+A virtual call, or any call through a register, has no address written into it, so the callers of a virtual function are not found.
+For such a function it names the class and slot instead, in binaries that keep MSVC RTTI.

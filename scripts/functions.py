@@ -23,6 +23,7 @@ ENDINGS = {"ret", "retf", "jmp", "int3", "iretq", "ud2"}
 VERIFIED = "verified"
 NO_UNWIND = "no unwind data"
 AFTER_GAP = "after undecodable bytes"
+AFTER_UNREAD = "after unreadable bytes"
 OVER_LIMIT = "function over 1 MiB"
 
 
@@ -128,12 +129,15 @@ class Functions:
     def _decoded(self, begin, end):
         if end - begin > MAX_DECODE_BYTES:
             return [], begin, OVER_LIMIT
-        raw = self.source.read(begin, end - begin)
+        # An unreadable page ends what decoding from the start can confirm; what precedes it stays confirmed.
+        unread = self.source.unread_from(begin, end)
+        readable = end if unread is None else unread
         starts, stop = [], begin
-        for va, size, _, _ in self.lite.disasm_lite(raw, begin):
-            starts.append(va)
-            stop = va + size
-        return starts, stop, AFTER_GAP
+        if readable > begin:
+            for va, size, _, _ in self.lite.disasm_lite(self.source.read(begin, readable - begin), begin):
+                starts.append(va)
+                stop = va + size
+        return starts, stop, AFTER_GAP if unread is None or stop + 15 <= unread else AFTER_UNREAD
 
     def _span(self, va):
         entry = self.source.owner(va)
@@ -170,6 +174,8 @@ class Functions:
         """
         source = self.source
         region = source.region_at(va)
+        if not source.image:
+            raise ValueError("No function data outside a module; give disasm an explicit --bytes")
         if not region.executable:
             raise ValueError("No function here: the address is not in a code section")
         base = source.base

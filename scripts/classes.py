@@ -44,16 +44,23 @@ class Classes:
         self.source = source
 
     def code_pointer(self, cell):
-        """The function a table slot at this address points to, or None when the cell is not a slot."""
+        """The function a table slot at this address points to, or None when the cell is not a slot.
+
+        In a running process a slot can point outside the image, where a mod redirected it. Such a cell is
+        still a slot when the image's relocation data says it holds an address.
+        """
+        source = self.source
         try:
-            value = struct.unpack("<Q", self.source.read(cell, 8))[0]
+            value = struct.unpack("<Q", source.read(cell, 8))[0]
         except ValueError:
             return None
-        region = self.source.region_of(value)
-        return value if region is not None and region.executable else None
+        if source.holds(value):
+            region = source.region_of(value)
+            return value if region is not None and region.executable else None
+        return value if source.relocated(cell) else None
 
     def slot_count(self, vtable, most):
-        """The slots of a table, counted up to `most`; it ends at the first cell that does not point into code."""
+        """The slots of a table, counted up to `most`; it ends at the first cell that is not a slot."""
         count = 0
         while count < most and self.code_pointer(vtable + count * 8) is not None:
             count += 1

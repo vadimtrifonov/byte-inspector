@@ -10,15 +10,17 @@ lazy import pefile
 from .analysis import FORMATS, Inspector
 from .output import Output, OutputClosed
 from .sources import PE, coordinate, integer
+lazy from .process import Live
 
 COMMANDS = {
-    "info": "File identity, sections, imports, and exports",
+    "info": "Identity, sections, imports, and exports; for a process, also its loaded modules",
     "find": "Search for text, byte patterns, or numbers",
     "refs": "Find instructions and stored pointers that refer to an address, or instructions that use a displacement",
     "disasm": "Disassemble a byte range or a whole function",
     "data": "Read values or a pointer table",
     "rtti": "Find the virtual function tables of a class by name",
     "describe": "Say what an address holds: its function and class slots, a string, an import, or an export",
+    "snapshot": "Save a module of a running process as a file that the other commands read with --file",
 }
 ADDRESSES = "rva:N, va:N, or offset:N; - reads the leading address of each line on standard input"
 
@@ -45,13 +47,45 @@ def signed_number(text):
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+class File:
+    """A file is one source: every address is in it."""
+
+    note = None
+
+    def __init__(self, path):
+        self.home = Inspector(PE(path))
+
+    def inspector(self, address):
+        return self.home, address
+
+    def close(self):
+        pass
+
+
 def parser():
-    root = Parser(prog="inspector", description="Read-only inspection of AMD64 code and data in PE files.")
+    root = Parser(
+        prog="inspector",
+        description="Read-only inspection of AMD64 code and data in PE files and running processes.",
+    )
     commands = root.add_subparsers(dest="command", required=True)
     for name, help_text in COMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
-        command.add_argument("--file", type=Path, required=True, help="AMD64 PE32+ executable or DLL")
+        source = command.add_mutually_exclusive_group(required=True)
+        if name != "snapshot":
+            source.add_argument(
+                "--file", type=Path, help="AMD64 PE32+ executable or DLL, or a module saved by snapshot"
+            )
+        source.add_argument("--process", help="Running process: the name of its executable, or its PID")
+        command.add_argument(
+            "--module",
+            help="With --process: the loaded module to work on, by name (default: the process's executable)",
+        )
         command.add_argument("--jsonl", action="store_true", help="Print JSON records instead of text lines")
+        if name == "snapshot":
+            command.add_argument(
+                "--output", type=Path, required=True, help="File to write; never overwritten"
+            )
+            continue
         if name != "data":
             command.add_argument(
                 "--limit", type=number, default=100, help="Results shown per query (1..10000; default 100)"
@@ -85,6 +119,9 @@ def parser():
                 )
                 bounds.add_argument(
                     "--function", action="store_true", help="The whole function that holds the address"
+                )
+                command.add_argument(
+                    "--before", type=number, default=0, help="Also show this many bytes before the address"
                 )
                 command.add_argument(
                     "--show-bytes", action="store_true", help="Show the bytes of each instruction"
@@ -128,32 +165,37 @@ def lines(tokens, stream):
 
 
 class Run:
-    def __init__(self, args, inspector, out):
+    def __init__(self, args, view, out):
         self.args = args
-        self.inspector = inspector
-        self.source = inspector.source
+        self.view = view
+        self.home = view.home  # the inspector of the file, or of the module that commands work on
         self.out = out
         self.failed = False
         self.listed = {}
 
-    def summary(self, query, fields):
+    def summary(self, query, fields, source):
         record = {"record": "summary", "command": self.args.command, "query": query, **fields}
-        record["warning"] = self.source.packed
+        # A read of unreadable bytes fails where it is asked for; a search would only come back with less,
+        # and so would anything that names what an address holds once the tables it uses are affected.
+        searched = self.args.command not in ("disasm", "data") or source.damaged
+        record["warning"] = "; ".join(filter(None, (source.packed, searched and source.unread))) or None
         if self.out.jsonl:
-            record.update(file=str(self.source.path), sha256=self.source.sha256)
+            for key, value in source.identity.items():  # a field the answer states itself stays its own
+                record.setdefault(key, value)
         self.out.emit(record)
 
     def error(self, query, message):
         self.failed = True
         self.out.emit({"record": "error", "query": query, "message": str(message)})
 
-    def answer(self, query, compute, key=None):
+    def answer(self, query, compute, key=None, inspector=None):
         """Print what one query returns; an answer already printed in this call is referred to, not repeated."""
+        source = (inspector or self.home).source
         try:
             if key is not None:
                 identity, fields = key(query)
                 if identity in self.listed:
-                    self.summary(query, {**fields, "listed_under": self.listed[identity]})
+                    self.summary(query, {**fields, "listed_under": self.listed[identity]}, source)
                     return
             answers = compute(query)
         except (ValueError, struct.error, OverflowError, capstone.CsError) as exc:
@@ -162,14 +204,26 @@ class Run:
         if key is not None:
             self.listed[identity] = query
         for fields, rows in answers:
-            self.summary(query, fields)
+            self.summary(query, fields, source)
             for row in rows:
                 self.out.emit({"record": "result", "query": query, **row})
 
-    def addresses(self, compute, key):
+    def addresses(self, command, key, anywhere=True):
+        """Answer each address with `command(inspector, address)`.
+
+        `anywhere` reads an address where it is; in a process that can be outside the module. Without it
+        the module is what gets searched, and the address is only what is searched for.
+        """
         for kind, text in lines(self.args.addresses, sys.stdin):
             if kind == "query":
-                self.answer(text, compute, key)
+                try:
+                    inspector, address = self.view.inspector(text) if anywhere else (self.home, text)
+                except ValueError as exc:
+                    self.error(text, exc)
+                    continue
+                self.answer(
+                    text, lambda _: command(inspector, address), lambda _: key(inspector, address), inspector
+                )
             elif kind == "note":
                 self.out.emit({"record": "note", "text": text})
             elif kind == "error":
@@ -178,20 +232,26 @@ class Run:
             else:
                 self.error(None, f"Not an address line: {text[:80]}")
 
-    def located(self, query):
-        return self.source.locate(query), {}
+    @staticmethod
+    def located(inspector, address):
+        return inspector.source.locate(address), {}
 
-    def function(self, query):
-        found = self.inspector.functions.function(self.source.va(query))
-        return found.start, {"function": self.source.show(found.start)}
+    @staticmethod
+    def function(inspector, address):
+        found = inspector.functions.function(inspector.source.va(address))
+        return found.start, {"function": inspector.source.show(found.start)}
 
     def __call__(self):
-        args, inspector = self.args, self.inspector
+        args, inspector = self.args, self.home
         limit = getattr(args, "limit", None)
         if limit is not None and not 1 <= limit <= 10000:
             raise ValueError("--limit must be 1..10000")
         scope = {name: getattr(args, name, None) for name in ("section", "start", "length")}
-        if args.command == "info":
+        if self.view.note:
+            self.out.emit({"record": "note", "text": self.view.note})
+        if args.command == "snapshot":  # a copy that cannot be saved fails the whole call
+            self.summary(inspector.source.name, self.view.save(args.output), inspector.source)
+        elif args.command == "info":
             for part, answer in inspector.info(limit=limit).items():
                 self.answer(part, lambda _: [answer])
         elif args.command == "find":
@@ -215,12 +275,17 @@ class Run:
                 compute = lambda _: inspector.refs(displacement=args.displacement, **options)  # noqa: E731
                 self.answer(f"displacement {args.displacement:#x}", compute)
             else:
-                self.addresses(lambda address: inspector.refs(address, **options), self.located)
+                self.addresses(
+                    lambda inspector, address: inspector.refs(address, **options),
+                    self.located,
+                    anywhere=False,
+                )
         elif args.command == "disasm":
             self.addresses(
-                lambda address: inspector.disasm(
+                lambda inspector, address: inspector.disasm(
                     address,
                     byte_count=args.bytes,
+                    before=args.before,
                     function=args.function,
                     limit=limit,
                     show_bytes=args.show_bytes,
@@ -229,10 +294,11 @@ class Run:
             )
         elif args.command == "data":
             self.addresses(
-                lambda address: inspector.data(address, value_type=args.type, count=args.count), self.located
+                lambda inspector, address: inspector.data(address, value_type=args.type, count=args.count),
+                self.located,
             )
         elif args.command == "describe":
-            self.addresses(lambda address: inspector.describe(address, limit=limit), self.located)
+            self.addresses(lambda inspector, address: inspector.describe(address, limit=limit), self.located)
         else:
             for name in args.names:
                 self.answer(
@@ -250,13 +316,20 @@ def main(argv=None):
         sys.stdout.reconfigure(errors="backslashreplace")
     out = Output(sys.stdout, args.jsonl)
     try:
+        view = None
         try:
-            code = Run(args, Inspector(PE(args.file)), out)()
+            if args.module is not None and args.process is None:
+                raise ValueError("--module names a module of a running process; give --process with it")
+            view = File(args.file) if args.process is None else Live(args.process, args.module)
+            code = Run(args, view, out)()
         except (OSError, ValueError, struct.error, OverflowError, pefile.PEFormatError) as exc:
             # The whole call failed: say so on both streams, because either one may be discarded.
             out.emit({"record": "error", "message": str(exc)})
             print(f"error: {exc}", file=sys.stderr)
             code = 1
+        finally:
+            if view is not None:
+                view.close()
         out.flush()
         return code
     except OutputClosed:

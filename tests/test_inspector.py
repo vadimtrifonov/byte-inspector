@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import BASE, fixture
+from support import BASE, fixture, saved_copy
 
 from scripts.analysis import Inspector
 from scripts.references import access, float_type
@@ -39,6 +39,10 @@ class InspectorTests(unittest.TestCase):
 
     def patched(self, patches, name="patched.dll"):
         return Inspector(PE(fixture(self.root / name, patches)))
+
+    def loaded(self, name="loaded.bin", **changes):
+        """The fixture as saved from a process that had it loaded."""
+        return Inspector(PE(saved_copy(self.path, self.root / name, **changes)))
 
     def test_identity_mapping_imports_and_exports(self):
         source = self.source
@@ -596,6 +600,202 @@ class InspectorTests(unittest.TestCase):
         self.assertEqual(one(describe("rva:0x1400"))[0]["no_bytes_in_file"], True)
         self.assertEqual(one(describe("offset:0x1200"))[0]["not_loaded"], True)
         self.assertEqual(one(describe("va:0x150000000"))[0], {"outside_the_image": True})
+
+    def test_a_listing_can_start_before_its_address(self):
+        disasm = self.inspector.disasm
+        # The bytes before the address start at an instruction where unwind data shows one.
+        summary, rows = one(disasm("rva:0x1016", before=5, byte_count=7))
+        self.assertEqual(
+            (summary["range"], addresses(rows)), ("rva:0x100c..rva:0x101d", ["rva:0x100c", "rva:0x1016"])
+        )
+        self.assertNotIn("note", summary)
+        self.assertEqual(
+            one(disasm("rva:0x1002", before=0x40, byte_count=5))[0]["range"], "rva:0x1000..rva:0x1007"
+        )
+        # Without unwind data they are decoded from the byte asked for, which can miss the address.
+        summary, rows = one(disasm("rva:0x10a5", before=3, byte_count=1))
+        self.assertEqual(addresses(rows), ["rva:0x10a2", "rva:0x10a4"])
+        self.assertIn("does not arrive at rva:0x10a5", summary["note"])
+        with self.assertRaises(ValueError):
+            disasm("rva:0x1016", before=5, function=True)
+
+    def test_a_saved_copy_of_a_loaded_module_answers_as_its_file_does(self):
+        mod = 0x7FF800000000
+        copy = self.loaded(modules=[("mod.dll", mod, 0x10000)])
+        path = copy.source.path
+        for ask in (
+            lambda inspector: inspector.refs("rva:0x1050"),
+            lambda inspector: inspector.rtti("Widget", slots=8),
+            lambda inspector: inspector.disasm("rva:0x1000", byte_count=48),
+            lambda inspector: inspector.find(text="Name", encoding="both")[0][1],  # a file has more to search
+            lambda inspector: inspector.describe("rva:0x1050")[0][1],
+        ):
+            self.assertEqual(ask(copy), ask(self.inspector))
+        # The record after the image is not part of the program: it is not searched, and info shows it.
+        self.assertEqual(one(copy.find(text="game.exe"))[0]["results"], 0)
+        self.assertEqual(copy.source.sha256, hashlib.sha256(path.read_bytes()).hexdigest())
+        info = copy.info()
+        self.assertEqual((info["sections"][0]["process"], info["sections"][0]["pid"]), ("game.exe", 4242))
+        self.assertEqual(
+            info["modules"][1],
+            [{"address": f"va:{mod:#x}", "name": "mod.dll", "size": "0x10000", "path": "mod.dll"}],
+        )
+        # An address in another loaded module is named by that module.
+        _, rows = one(
+            self.loaded(
+                "hooked.bin",
+                patches={0x2090: struct.pack("<Q", mod + 0x1234)},
+                modules=[("mod.dll", mod, 0x10000)],
+            ).data("rva:0x2088", value_type="pointer", count=2)
+        )
+        self.assertEqual(
+            rows[1]["points_to"], {"address": f"va:{mod + 0x1234:#x}", "in": "mod.dll rva:0x1234"}
+        )
+
+    def test_a_loaded_module_is_read_where_it_is_and_as_the_process_held_it(self):
+        # Windows can load a module away from the base its header prefers, and the header keeps the file's layout.
+        there = 0x7FF712340000
+        copy = self.loaded(base=there)
+        self.assertEqual(copy.info()["sections"][0]["image_base"], f"va:{there:#x}")
+        self.assertEqual(
+            one(copy.data(f"va:{there:#x}", count=2))[1],
+            [{"address": "rva:0x0", "bytes": "4d 5a", "ascii": "MZ"}],
+        )
+        self.assertEqual(
+            one(copy.disasm("rva:0x1050", byte_count=6))[1][0]["target"]["import"],
+            "KERNEL32.dll!LoadLibraryW",
+        )
+        # The size and position of .text in the file, as the header in memory still states them.
+        _, rows = one(copy.data("rva:0x198", value_type="u32", count=2))
+        self.assertEqual([row["value"] for row in rows], [0x400, 0x400])
+
+    def test_an_import_cell_says_what_it_imports_and_where_it_leads(self):
+        mod = 0x7FF800000000
+        leads = {"address": f"va:{mod + 0x1234:#x}", "in": "mod.dll rva:0x1234"}
+        cell = {0x2190: struct.pack("<Q", mod + 0x1234)}
+        modules = [("mod.dll", mod, 0x10000)]
+        # In a process the cell holds an address, which need not be in the DLL the import names.
+        copy = self.loaded(patches=cell, modules=modules)
+        named = {"address": "rva:0x2190", "import": "KERNEL32.dll!LoadLibraryW", "points_to": leads}
+        self.assertEqual(one(copy.disasm("rva:0x1050", byte_count=6))[1][0]["target"], named)
+        self.assertEqual(one(copy.describe("rva:0x2190"))[1], [named])
+        self.assertEqual(copy.info()["imports"][1], [{**named, "delayed": False}])
+        # A module without a separate table of names loses them to the addresses the loader writes.
+        copy = self.loaded("unnamed.bin", patches={0x2100: bytes(4), **cell}, modules=modules)
+        summary, rows = copy.info()["imports"]
+        self.assertEqual(
+            (summary, rows[0]["import"]), ({"results": 1, "names_unavailable": 1}, "KERNEL32.dll")
+        )
+        self.assertEqual(
+            one(copy.describe("rva:0x2190"))[1],
+            [
+                {
+                    "address": "rva:0x2190",
+                    "import": "KERNEL32.dll",
+                    "name_unavailable": True,
+                    "points_to": leads,
+                }
+            ],
+        )
+
+    def test_class_tables_keep_the_slots_a_mod_redirected(self):
+        mod = 0x7FF800000000
+        there, nowhere = mod + 0x1000, 0x7FF900000000
+        patches = {0x2548: struct.pack("<Q", there), 0x2508: struct.pack("<Q", nowhere)}
+        modules = [("mod.dll", mod, 0x10000)]
+        copy = self.loaded(patches=patches, relocated=[0x2508, 0x2548, 0x2550], modules=modules)
+        primary, secondary = copy.rtti("Widget", slots=8)
+        self.assertEqual(
+            primary[1],
+            [
+                {"address": f"va:{there:#x}", "in": "mod.dll rva:0x1000", "slot": 0, "cell": "rva:0x2548"},
+                {"address": "rva:0x1000", "slot": 1, "cell": "rva:0x2550"},
+            ],
+        )
+        self.assertEqual(secondary[1], [{"address": f"va:{nowhere:#x}", "slot": 0, "cell": "rva:0x2508"}])
+        # From the address a mod put there back to the class and slot it took over.
+        self.assertEqual(
+            one(copy.refs(f"va:{there:#x}", kind="pointer")),
+            (
+                {"results": 1, "target": {"in": "mod.dll rva:0x1000"}},
+                [{"address": "rva:0x2548", "pointer": True, "class": "Widget", "slot": 0}],
+            ),
+        )
+        row = one(copy.describe("rva:0x2548"))[1][0]
+        self.assertEqual(
+            (row["class"], row["slot"], row["points_to"]),
+            ("Widget", 0, {"address": f"va:{there:#x}", "in": "mod.dll rva:0x1000"}),
+        )
+        # Only relocation data says that a cell with an address outside the image holds an address.
+        bare = self.loaded("bare.bin", patches=patches, modules=modules)
+        self.assertEqual(bare.rtti("Widget"), [({"tables": 0}, [])])
+
+    def test_bytes_that_a_process_did_not_let_be_read_are_not_read_as_zeros(self):
+        copy = self.loaded(unreadable=[(0x2000, 0x3000, "no access")])
+        source = copy.source
+        with self.assertRaisesRegex(ValueError, "Cannot read rva:0x2040 from the process: no access"):
+            source.read(BASE + 0x2040, 1)
+        self.assertEqual(one(copy.find(text="AnchorName"))[0], {"results": 0, "scanned_bytes": 0x3000})
+        self.assertEqual(one(copy.describe("rva:0x2040"))[0]["unreadable"], True)
+        with self.assertRaisesRegex(ValueError, "no file offsets"):  # no other way to the same bytes
+            copy.data("offset:0x2040", count=1)
+        self.assertEqual(
+            one(copy.disasm("rva:0x1000", byte_count=7))[1][0]["target"],
+            {"address": "rva:0x2040", "unreadable": True},
+        )
+        self.assertEqual(
+            copy.info()["unreadable"][1],
+            [{"address": "rva:0x2000", "size": "0x1000", "unreadable": "no access"}],
+        )
+        # The section held the import and export tables, so every command's results can lack names.
+        self.assertEqual(source.damaged, ["exports", "imports"])
+        self.assertRegex(
+            source.unread, r"0x1000 bytes could not be read .* holds exports, imports \(info lists"
+        )
+        code = self.loaded("code.bin", unreadable=[(0x1000, 0x2000, "no access")]).source
+        self.assertEqual((code.damaged, code.spans(executable=True)), ([], []))
+        # Without its unwind data a module has no function bounds; its code and its ranges are still read.
+        bare = self.loaded("bare.bin", unreadable=[(0x3000, 0x4000, "no access")])
+        self.assertEqual((bare.source.damaged, bare.source.entries), (["unwind data"], []))
+        summary, rows = one(bare.disasm("rva:0x1002", byte_count=5))
+        self.assertEqual((summary["range"], addresses(rows)), ("rva:0x1002..rva:0x1007", ["rva:0x1002"]))
+        self.assertEqual(bare.info()["unreadable"][1][0]["address"], "rva:0x3000")
+
+    def test_unreadable_bytes_in_a_function_hide_only_what_needs_them(self):
+        # The function at 0x1000 with four bytes missing from the middle of its third instruction.
+        holed = self.loaded("holed.bin", unreadable=[(0x1010, 0x1014, "no access")])
+        summary, rows = one(holed.disasm("rva:0x1007", byte_count=5))
+        self.assertEqual((addresses(rows), summary["function"]), (["rva:0x1007"], "rva:0x1000"))
+        # A search still confirms the instructions before those bytes, and marks the ones after them.
+        _, rows = one(holed.refs("rva:0x2040", kind="memory"))
+        self.assertEqual(
+            [(row["address"], row.get("unverified")) for row in rows][:2],
+            [("rva:0x1000", None), ("rva:0x1016", "after unreadable bytes")],
+        )
+        self.assertEqual(one(holed.describe("rva:0x1007"))[1][0]["address"], "rva:0x1000")
+        # A listing gives what precedes them and says where it stopped; the function's other piece follows.
+        summary, rows = one(holed.disasm("rva:0x1000", function=True))
+        self.assertEqual(addresses(rows)[:4], ["rva:0x1000", "rva:0x1007", "rva:0x1080", "rva:0x1085"])
+        self.assertEqual((summary["unreadable_at"], "undecodable_at" in summary), (["rva:0x1010"], False))
+        summary, rows = one(holed.disasm("rva:0x1000", byte_count=0x20))
+        self.assertEqual(
+            (addresses(rows), summary["unreadable_at"]), (["rva:0x1000", "rva:0x1007"], ["rva:0x1010"])
+        )
+        summary, rows = one(holed.disasm("rva:0x1000"))  # without a size it would have gone on
+        self.assertEqual(
+            (summary["range"], summary["unreadable_at"]), ("rva:0x1000..rva:0x1010", ["rva:0x1010"])
+        )
+        with self.assertRaisesRegex(ValueError, "only 9 precede rva:0x1010, which could not be read"):
+            holed.data("rva:0x1007", count=16)
+
+    def test_a_saved_copy_says_when_a_jump_goes_through_a_cell_it_does_not_hold(self):
+        # A mod's call through a cell in memory of its own, which is not part of the module that was saved.
+        cell = BASE + 0x10000
+        copy = self.loaded(patches={0x1050: rip(0x1050, b"\xff\x15", 0x10000)})
+        self.assertEqual(
+            one(copy.disasm("rva:0x1050", byte_count=6))[1][0]["target"],
+            {"address": f"va:{cell:#x}", "not_saved": True},
+        )
 
     def test_code_that_looks_encrypted_is_reported(self):
         self.assertIsNone(self.source.packed)
