@@ -27,7 +27,7 @@ rva:0x2da9  lea rdx, [rip + 0x4af4560]  address taken  function rva:0x2da0
 rva:0x3299  lea rdx, [rip + 0x4af4070]  address taken  function rva:0x3270
 ```
 
-`--limit N` applies to each query separately (1..10000, default 100).
+`--limit N` applies to each query separately (1..10000; default 100, or 10000 for `disasm --function`).
 A summary gives the full count, and `showing` when the limit cut the results.
 
 `--jsonl` prints the same facts as JSON records, one per line; `record` is `summary`, `result`, `error`, or `note`.
@@ -104,7 +104,7 @@ A string row leads with the start of the string, with `query at` when the addres
 ## disasm
 
 ```powershell
-mise run inspector -- disasm rva:0x2da9 --function --file $exe --limit 300
+mise run inspector -- disasm rva:0x2da9 --function --file $exe
 mise run inspector -- disasm rva:0x2da9 --bytes 19 --show-bytes --file $exe
 mise run inspector -- disasm rva:0x2feedd --bytes 11 --file $exe
 ```
@@ -121,7 +121,6 @@ rva:0x2feee3  vmovss dword ptr [rbx + 0x7c], xmm0
 
 Without options, a listing covers up to 256 bytes from the address.
 `--bytes N` sets the byte count (up to 1 MiB); `--function` lists the whole function that holds the address, piece by piece.
-A listing shows at most `--limit` instructions, so a function longer than the default 100 needs a higher limit.
 `--before N` starts the listing N bytes before the address, which shows how the values an instruction uses were set.
 Where unwind data covers the address, decoding starts again at the start of its function, or of the piece that holds it, so bytes before the function that are not code cannot put the listing out of step.
 `--show-bytes` adds each instruction's bytes, for signatures and patch sizes.

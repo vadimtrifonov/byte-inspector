@@ -23,6 +23,7 @@ COMMANDS = {
     "snapshot": "Save a module of a running process as a file that the other commands read with --file",
 }
 ADDRESSES = "rva:N, va:N, or offset:N; - reads the leading address of each line on standard input"
+DEFAULT_LIMIT, MAX_LIMIT = 100, 10000
 
 
 class Parser(argparse.ArgumentParser):
@@ -87,8 +88,11 @@ def parser():
             )
             continue
         if name != "data":
+            default = f"default {DEFAULT_LIMIT}"
+            if name == "disasm":
+                default += f", or {MAX_LIMIT} with --function"
             command.add_argument(
-                "--limit", type=number, default=100, help="Results shown per query (1..10000; default 100)"
+                "--limit", type=number, help=f"Results shown per query (1..{MAX_LIMIT}; {default})"
             )
         if name in ("find", "refs"):
             command.add_argument("--section", help="Search only this section, by exact name")
@@ -247,8 +251,10 @@ class Run:
     def __call__(self):
         args, inspector = self.args, self.home
         limit = getattr(args, "limit", None)
-        if limit is not None and not 1 <= limit <= 10000:
-            raise ValueError("--limit must be 1..10000")
+        if limit is None:
+            limit = MAX_LIMIT if getattr(args, "function", False) else DEFAULT_LIMIT
+        elif not 1 <= limit <= MAX_LIMIT:
+            raise ValueError(f"--limit must be 1..{MAX_LIMIT}")
         scope = {name: getattr(args, name, None) for name in ("section", "start", "length")}
         if self.view.note:
             self.out.emit({"record": "note", "text": self.view.note})

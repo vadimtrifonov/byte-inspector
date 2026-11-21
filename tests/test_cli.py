@@ -107,6 +107,19 @@ class CommandLineTests(unittest.TestCase):
             [["# refs displacement 0x3f4", "results 1"], ["# refs displacement 0x1039", "results 1"]],
         )
 
+    def test_a_function_is_listed_whole_unless_a_limit_is_given(self):
+        long = fixture(self.root / "long.dll", {0x1100: b"\xff\xc0" * 120 + b"\xc3"})  # 121 instructions
+        for arguments, shown in (
+            (["--function"], 121),
+            (["--function", "--limit", "50"], 50),
+            (["--bytes", "241"], 100),  # the default of every other listing
+        ):
+            code, lines, _ = self.run_cli("disasm", "rva:0x1100", *arguments, path=long)
+            with self.subTest(arguments=arguments):
+                self.assertIn("  instructions 121", lines[0])
+                self.assertEqual("  showing " in lines[0], shown < 121)
+                self.assertEqual((code, len(lines) - 1), (0, shown))
+
     def test_a_failed_address_is_reported_in_place_and_the_rest_are_answered(self):
         code, lines, err = self.run_cli(
             "data", "rva:0x2040", "rva:0x1400", "bogus", "rva:0x2060", "--count", "4"
