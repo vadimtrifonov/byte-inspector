@@ -399,8 +399,9 @@ class InspectorTests(unittest.TestCase):
             rip(0x1100, bytes.fromhex("c5fa5905"), 0x2700)  # vmulss xmm0, xmm0, [0x2700]
             + rip(0x1108, bytes.fromhex("f20f1005"), 0x2708)  # movsd xmm0, [0x2708]
             + rip(0x1110, bytes.fromhex("c5fa1105"), 0x2700)  # vmovss [0x2700], xmm0
+            + rip(0x1118, bytes.fromhex("c5fa1005"), 0x2710)  # vmovss xmm0, [0x2710]
         )
-        patches = {0x1100: code, 0x2700: struct.pack("<f4xd", 0.5625, 0.1)}
+        patches = {0x1100: code, 0x2700: struct.pack("<f4xdI", 0.5625, 0.1, 0x7FFFFFFF)}
         _, rows = one(self.patched(patches).disasm("rva:0x1100", byte_count=len(code)))
         self.assertEqual(
             [row["target"] for row in rows],
@@ -408,6 +409,7 @@ class InspectorTests(unittest.TestCase):
                 {"address": "rva:0x2700", "f32": "0.5625"},
                 {"address": "rva:0x2708", "f64": "0.1"},
                 {"address": "rva:0x2700"},  # a store reads nothing
+                {"address": "rva:0x2710", "f32": "nan", "hex": "0x7fffffff"},
             ],
         )
         # A value in a writable section is only what the file starts with, so it is not shown.
@@ -457,6 +459,7 @@ class InspectorTests(unittest.TestCase):
         )
         _, rows = one(data("rva:0x2700", value_type="f32", count=3))
         self.assertEqual([row["value"] for row in rows], ["nan", "70.0", "0.1"])
+        self.assertEqual([row.get("hex") for row in rows], ["0x7fc00000", None, None])
         json.dumps(rows, allow_nan=False)
         self.assertEqual(one(data("rva:0x2710", value_type="f32", count=1))[1][0]["value"], "3.4028235e+38")
         _, rows = one(data("rva:0x270c", value_type="i32", count=1))

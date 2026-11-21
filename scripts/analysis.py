@@ -86,6 +86,15 @@ def shortest(value, fmt):
     return repr(value)
 
 
+def stored_float(raw, fmt, name):
+    """A stored float as fields. A NaN also gives its bits: a bit mask such as 0x7fffffff reads as one."""
+    value = struct.unpack(fmt, raw)[0]
+    fields = {name: shortest(value, fmt)}
+    if math.isnan(value):
+        fields["hex"] = hex(int.from_bytes(raw, "little"))
+    return fields
+
+
 class Inspector:
     def __init__(self, source, elsewhere=None, pointer=None):
         self.source = source
@@ -185,7 +194,7 @@ class Inspector:
             raw = self.source.read(va, struct.calcsize(fmt))
         except ValueError:
             return {}
-        return {kind: shortest(struct.unpack(fmt, raw)[0], fmt)}
+        return stored_float(raw, fmt, kind)
 
     def import_cell(self, va):
         """An import cell: the import the image declares and, in a process, where the cell led when read.
@@ -704,12 +713,14 @@ class Inspector:
                     {"address": source.show_offset(offset + at), "bytes": chunk.hex(" "), "ascii": text}
                 )
             return [({"type": value_type, "count": count}, rows)]
-        for index, (value,) in enumerate(struct.iter_unpack(fmt, raw)):
-            row = {"address": source.show_offset(offset + index * width)}
+        for at in range(0, len(raw), width):
+            cell = raw[at : at + width]
+            (value,) = struct.unpack(fmt, cell)
+            row = {"address": source.show_offset(offset + at)}
             if value_type == "pointer":
                 row["points_to"] = self.held(value)
             elif isinstance(value, float):
-                row["value"] = shortest(value, fmt)
+                row.update(stored_float(cell, fmt, "value"))
             else:
                 row.update(value=value, hex=hex(value % (1 << (8 * width))))
             rows.append(row)
