@@ -311,6 +311,11 @@ class InspectorTests(unittest.TestCase):
             functions.function(BASE + 0x1098)
         with self.assertRaisesRegex(ValueError, "not in a code section"):
             functions.function(BASE + 0x2040)
+        # A byte that is not code stops the walk, which then starts at the called address past it.
+        after = self.patched({0x1094: b"\x06"}, "table.dll").functions
+        self.assertEqual((after.function(BASE + 0x10A5), after.function(BASE + 0x10B2)), (called, bare))
+        with self.assertRaisesRegex(ValueError, "no direct call or pointer shows a function start"):
+            after.function(BASE + 0x1098)
 
     def test_empty_unwind_entries_leave_valid_ranges_intact(self):
         expected = self.source.entries

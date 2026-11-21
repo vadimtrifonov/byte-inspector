@@ -194,6 +194,8 @@ class Functions:
 
         A function ends at a return or jump that no earlier branch jumps past.
         An address that a verified call instruction or a stored pointer refers to starts a function.
+        Bytes that are not code, such as the jump table of a function without unwind data, stop decoding;
+        the walk then starts past them, at the nearest such address at or before this one.
         """
         source = self.source
         region = source.region_at(va)
@@ -227,10 +229,29 @@ class Functions:
         def entered(address):
             return address in pointers or calls(address) > 0
 
+        def stopped(begin):
+            """Where decoding from `begin` stops before it gets to the address; None when it gets there."""
+            stop = begin
+            for address, size, _, _ in self.lite.disasm_lite(source.read(begin, ceiling - begin), begin):
+                if address >= va:
+                    return None
+                stop = address + size
+            return stop
+
+        begin = floor
+        while (stop := stopped(begin)) is not None:
+            low, high = bisect.bisect_right(strong, stop), bisect.bisect_right(strong, va)
+            begin = next((address for address in reversed(strong[low:high]) if entered(address)), None)
+            if begin is None:
+                raise ValueError(
+                    "Cannot estimate a function: bytes before this address do not decode as code, "
+                    "and no direct call or pointer shows a function start after them"
+                )
+
         start = end = on_boundary = None
         ended, reach, padding = True, 0, False
         for address, size, mnemonic, operands in self.lite.disasm_lite(
-            source.read(floor, ceiling - floor), floor
+            source.read(begin, ceiling - begin), begin
         ):
             if on_boundary is None and address > va:
                 on_boundary = False
@@ -266,10 +287,6 @@ class Functions:
             if mnemonic in ENDINGS and reach < address + size:
                 ended = True
             end = address + size
-        if on_boundary is None and not padding:
-            raise ValueError(
-                "Cannot estimate a function: the bytes before this address do not decode as code"
-            )
         if start is None or padding:
             raise ValueError("No function here: the address is in padding between functions")
         evidence = []
