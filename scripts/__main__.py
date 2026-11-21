@@ -105,7 +105,10 @@ def parser():
         elif name == "refs":
             command.add_argument("addresses", nargs="*", help=f"Targets: {ADDRESSES}")
             command.add_argument(
-                "--displacement", type=signed_number, help="Nonzero signed memory displacement"
+                "--displacement",
+                type=signed_number,
+                action="append",
+                help="Nonzero signed memory displacement; repeat for several",
             )
             command.add_argument(
                 "--kind", choices=("all", "call", "branch", "memory", "pointer"), default="all"
@@ -272,8 +275,11 @@ class Run:
                 raise ValueError("Give addresses or --displacement, not both")
             options = {"kind": args.kind, "limit": limit, "scope": scope}
             if args.displacement is not None:
-                compute = lambda _: inspector.refs(displacement=args.displacement, **options)  # noqa: E731
-                self.answer(f"displacement {args.displacement:#x}", compute)
+                for displacement in args.displacement:
+                    self.answer(
+                        f"displacement {displacement:#x}",
+                        lambda _: inspector.refs(displacement=displacement, **options),
+                    )
             else:
                 self.addresses(
                     lambda inspector, address: inspector.refs(address, **options),

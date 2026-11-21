@@ -144,7 +144,7 @@ A direct call or jump has a `target` only when its destination is exported, is a
 
 ```powershell
 mise run inspector -- refs rva:0x123450 rva:0x456780 --file $exe --kind call
-mise run inspector -- refs --displacement 0x3F4 --file $exe --section .text
+mise run inspector -- refs --displacement 0x3F4 --displacement 0x3F8 --file $exe --section .text
 ```
 
 `--kind` selects `all` (default), `call`, `branch`, `memory`, or `pointer`.

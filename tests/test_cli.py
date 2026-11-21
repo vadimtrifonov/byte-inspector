@@ -99,6 +99,14 @@ class CommandLineTests(unittest.TestCase):
         )
         self.assertEqual([text.startswith("#") for text in lines], [True, False, False, True, False, False])
 
+    def test_each_displacement_is_answered_alone(self):
+        code, lines, _ = self.run_cli("refs", "--displacement", "0x3F4", "--displacement", "0x1039")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [text.split("  ")[:2] for text in lines if text.startswith("#")],
+            [["# refs displacement 0x3f4", "results 1"], ["# refs displacement 0x1039", "results 1"]],
+        )
+
     def test_a_failed_address_is_reported_in_place_and_the_rest_are_answered(self):
         code, lines, err = self.run_cli(
             "data", "rva:0x2040", "rva:0x1400", "bogus", "rva:0x2060", "--count", "4"
