@@ -78,7 +78,6 @@ In tests on functions with known starts, the start was wrong in 0–2% of estima
 An estimated function ends at the first return or jump that no earlier branch passes; later blocks reached only from elsewhere are not included.
 
 A function without unwind data is named only where a command estimates it: `describe`, `disasm --function`, and the instruction rows of `refs`.
-Other mentions of an address in such code have no `function` field.
 
 ## describe
 
@@ -122,10 +121,10 @@ rva:0x2feee3  vmovss dword ptr [rbx + 0x7c], xmm0
 Without options, a listing covers up to 256 bytes from the address.
 `--bytes N` sets the byte count (up to 1 MiB); `--function` lists the whole function that holds the address, piece by piece.
 `--before N` starts the listing N bytes before the address, which shows how the values an instruction uses were set.
-Where unwind data covers the address, decoding starts again at the start of its function, or of the piece that holds it, so bytes before the function that are not code cannot put the listing out of step.
 `--show-bytes` adds each instruction's bytes, for signatures and patch sizes.
 
 Where unwind data covers the address, a listing starts at the instruction that holds it; the summary says `inside instruction rva:…` when that moved the start back.
+With `--before`, decoding starts again at the start of its function, or of the piece that holds it, so bytes before the function that are not code cannot put the listing out of step.
 Elsewhere decoding starts at the given byte.
 With `--before`, such a start can be inside an instruction; the summary ends with a `note` when decoding then does not arrive at the address.
 Decoding is linear and does not stop at a return, so data that lies in code, such as a jump table, is printed as instructions.
@@ -275,7 +274,7 @@ mise run inspector -- snapshot --process SkyrimVR.exe --output "$env:TEMP\skyrim
 Saves the module as a file that every command reads with `--file`, with the answers the process gave at that moment.
 An existing file is never overwritten.
 
-The file is the module's bytes as read from memory, followed by a record that `info` prints: the process and its PID, the read time, every loaded module, and the ranges that could not be read.
+The file is the module's bytes as read from memory, followed by the record of the process that `info` prints.
 The bytes lie as they did in memory, not as in a PE file on disk, so `offset:` is refused as for a process.
 
 The copy holds the bytes of that module only.
