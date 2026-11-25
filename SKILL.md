@@ -10,8 +10,8 @@ Commands read a PE file or a running process and never change either.
 
 ```powershell
 mise trust mise.toml
-mise run inspector -- <command> --file "C:\Path\To\image.exe" ...
-mise run inspector -- <command> --process Game.exe ...
+mise run inspector <command> --file "C:\Path\To\image.exe" ...
+mise run inspector <command> --process Game.exe ...
 ```
 
 ## Output
@@ -60,7 +60,7 @@ When the whole call fails, one `error:` line goes to both stdout and stderr.
 The address `-` reads standard input and takes the first field of each line as an address, so one command's lines feed another.
 
 ```powershell
-mise run inspector -- refs rva:0x62b200 --kind call --file $exe | mise run inspector -- disasm - --function --file $exe
+mise run inspector refs rva:0x62b200 --kind call --file $exe | mise run inspector disasm - --function --file $exe
 ```
 
 `#` lines pass through unchanged, so earlier summaries stay visible.
@@ -82,7 +82,7 @@ A function without unwind data is named only where a command estimates it: `desc
 ## describe
 
 ```powershell
-mise run inspector -- describe rva:0xa94b90 rva:0x62b217 --file $exe
+mise run inspector describe rva:0xa94b90 rva:0x62b217 --file $exe
 ```
 
 ```
@@ -103,9 +103,9 @@ A string row leads with the start of the string, with `query at` when the addres
 ## disasm
 
 ```powershell
-mise run inspector -- disasm rva:0x2da9 --function --file $exe
-mise run inspector -- disasm rva:0x2da9 --bytes 19 --show-bytes --file $exe
-mise run inspector -- disasm rva:0x2feedd --bytes 11 --file $exe
+mise run inspector disasm rva:0x2da9 --function --file $exe
+mise run inspector disasm rva:0x2da9 --bytes 19 --show-bytes --file $exe
+mise run inspector disasm rva:0x2feedd --bytes 11 --file $exe
 ```
 
 ```
@@ -141,8 +141,8 @@ A direct call or jump has a `target` only when its destination is exported, is a
 ## refs
 
 ```powershell
-mise run inspector -- refs rva:0x123450 rva:0x456780 --file $exe --kind call
-mise run inspector -- refs --displacement 0x3F4 --displacement 0x3F8 --file $exe --section .text
+mise run inspector refs rva:0x123450 rva:0x456780 --file $exe --kind call
+mise run inspector refs --displacement 0x3F4 --displacement 0x3F8 --file $exe --section .text
 ```
 
 `--kind` selects `all` (default), `call`, `branch`, `memory`, or `pointer`.
@@ -162,9 +162,9 @@ Displacements from -128 to 127 need `--section` or `--start`/`--length` covering
 ## find
 
 ```powershell
-mise run inspector -- find --text "Gravity" --text "fJump" --ignore-case --encoding both --file $exe
-mise run inspector -- find --pattern "48 8D ?? ?? ?? ?? ?? E8" --section .text --file $exe
-mise run inspector -- find --value 0x1234 --type u32 --file $exe
+mise run inspector find --text "Gravity" --text "fJump" --ignore-case --encoding both --file $exe
+mise run inspector find --pattern "48 8D ?? ?? ?? ?? ?? E8" --section .text --file $exe
+mise run inspector find --value 0x1234 --type u32 --file $exe
 ```
 
 ```
@@ -184,8 +184,8 @@ Searches cover the whole file; `--section NAME` or `--start ADDRESS --length N` 
 ## data
 
 ```powershell
-mise run inspector -- data rva:0x4b87a48 --type pointer --count 8 --file $exe
-mise run inspector -- data rva:0x3b4a144 --type f32 --count 4 --file $exe
+mise run inspector data rva:0x4b87a48 --type pointer --count 8 --file $exe
+mise run inspector data rva:0x3b4a144 --type f32 --count 4 --file $exe
 ```
 
 Types are `u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 pointer`, little-endian; `--count` defaults to 16 (maximum 4096).
@@ -195,8 +195,8 @@ A `pointer` row says what the address it points to holds.
 ## rtti
 
 ```powershell
-mise run inspector -- rtti Actor BSScript::Object --slots 2 --limit 1 --file $exe
-mise run inspector -- rtti Actor --slot-start 275 --slots 1 --limit 1 --file $exe
+mise run inspector rtti Actor BSScript::Object --slots 2 --limit 1 --file $exe
+mise run inspector rtti Actor --slot-start 275 --slots 1 --limit 1 --file $exe
 ```
 
 ```
@@ -215,7 +215,7 @@ Only MSVC x64 RTTI is supported.
 ## info
 
 ```powershell
-mise run inspector -- info --file $exe --limit 50
+mise run inspector info --file $exe --limit 50
 ```
 
 Prints the file's SHA-256, image base, and entry point, then sections with their entropy, imports with their IAT cells, and exports.
@@ -225,8 +225,8 @@ For a process or a saved copy of a module, it also names the process and the rea
 ## Running processes
 
 ```powershell
-mise run inspector -- info --process SkyrimVR.exe
-mise run inspector -- disasm rva:0x48060 --process 51216 --module python315.dll
+mise run inspector info --process SkyrimVR.exe
+mise run inspector disasm rva:0x48060 --process 51216 --module python315.dll
 ```
 
 `--process` takes the name of an executable or a PID, in place of `--file`.
@@ -268,7 +268,7 @@ A read of them fails, and a summary ends with a `warning` when results can be mi
 ## snapshot
 
 ```powershell
-mise run inspector -- snapshot --process SkyrimVR.exe --output "$env:TEMP\skyrimvr.bin"
+mise run inspector snapshot --process SkyrimVR.exe --output "$env:TEMP\skyrimvr.bin"
 ```
 
 Saves the module as a file that every command reads with `--file`, with the answers the process gave at that moment.

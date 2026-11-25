@@ -13,6 +13,7 @@ auto = true
 
 [tasks.inspector]
 description = "Run Byte Inspector"
+raw_args = true
 run = "python -B -m scripts"
 quiet = true
 
